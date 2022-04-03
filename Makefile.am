@@ -146,10 +146,21 @@ ecdsa_example_SOURCES = examples/ecdsa.c
 ecdsa_example_CPPFLAGS = -I$(top_srcdir)/include
 ecdsa_example_LDADD = libsecp256k1.la
 ecdsa_example_LDFLAGS = -static
+
+noinst_PROGRAMS += spbs_example
+spbs_example_SOURCES = examples/spbs.c
+spbs_example_CPPFLAGS = -I$(top_srcdir)/include
+spbs_example_LDADD = libsecp256k1.la
+spbs_example_LDFLAGS = -static
+
 if BUILD_WINDOWS
 ecdsa_example_LDFLAGS += -lbcrypt
+spbs_example_LDFLAGS += -lbcrypt
 endif
+
 TESTS += ecdsa_example
+TESTS += spbs_example
+
 if ENABLE_MODULE_ECDH
 noinst_PROGRAMS += ecdh_example
 ecdh_example_SOURCES = examples/ecdh.c

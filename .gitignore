@@ -9,6 +9,7 @@ valgrind_ctime_test
 ecdh_example
 ecdsa_example
 schnorr_example
+spbs_example
 *.exe
 *.so
 *.a
