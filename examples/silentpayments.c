@@ -37,7 +37,7 @@ static double now_seconds(void) {
 #  if defined(CLOCK_MONOTONIC)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec  (double)ts.tv_nsec / 1e9;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 #  else
     /* Fallback if CLOCK_MONOTONIC is unavailable */
     return (double)clock() / (double)CLOCKS_PER_SEC;
@@ -52,7 +52,8 @@ static double now_seconds(void) {
 #include "examples_util.h"
 
 #define N_INPUTS  2
-#define N_OUTPUTS 40000
+#define N_OUTPUTS 3200
+#define MAX_LABELS N_OUTPUTS
 
 /* Static data for Bob and Carol's silent payment addresses */
 static unsigned char smallest_outpoint[36] = {
@@ -110,17 +111,9 @@ static unsigned char carol_address[2][33] = {
 
 /** Labels
  *
- *  The structs and callback function are implemented here as a demonstration
- *  of how the label lookup callback is meant to query a label cache and return
- *  the label tweak when a match is found. This is for demonstration purposes
- *  only and not optimized. In production, it is expected that the
- *  caller will be using a much more performant method for storing and querying
- *  labels.
- *
- *  Recipients not using labels can ignore these steps and simply pass `NULL`
- *  for the label_lookup and label_context arguments:
- *
- *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL, NULL);
+ *  Demo label cache + lookup callback. We also collect simple stats:
+ *    - lookup_calls: how many times the wallet asked "is this label mine?"
+ *    - lookup_hits:  how many times the answer was "yes"
  */
 
 struct label_cache_entry {
@@ -130,7 +123,10 @@ struct label_cache_entry {
 
 struct labels_cache {
     size_t entries_used;
-    struct label_cache_entry entries[5];
+    size_t entries_capacity;
+    struct label_cache_entry *entries;
+    size_t lookup_calls;
+    size_t lookup_hits;
 };
 
 const unsigned char* label_lookup(
@@ -138,9 +134,13 @@ const unsigned char* label_lookup(
     const void* cache_ptr
 ) {
     const struct labels_cache* cache = (const struct labels_cache*)cache_ptr;
+    /* Cast away const for stats increments - safe here. */
+    struct labels_cache* mcache = (struct labels_cache*)cache_ptr;
     size_t i;
+    mcache->lookup_calls++;
     for (i = 0; i < cache->entries_used; i++) {
         if (memcmp(cache->entries[i].label, label33, 33) == 0) {
+            mcache->lookup_hits++;
             return cache->entries[i].label_tweak;
         }
     }
@@ -153,17 +153,19 @@ int main(void) {
     secp256k1_xonly_pubkey tx_inputs[N_INPUTS];
     const secp256k1_xonly_pubkey *tx_input_ptrs[N_INPUTS];
     
-    secp256k1_xonly_pubkey *tx_outputs = malloc(N_OUTPUTS * sizeof(secp256k1_xonly_pubkey));
-    secp256k1_xonly_pubkey **tx_output_ptrs = malloc(N_OUTPUTS * sizeof(secp256k1_xonly_pubkey*));
-    secp256k1_silentpayments_found_output *found_outputs = malloc(N_OUTPUTS * sizeof(secp256k1_silentpayments_found_output));
-    secp256k1_silentpayments_found_output **found_output_ptrs = malloc(N_OUTPUTS * sizeof(secp256k1_silentpayments_found_output*));
+    secp256k1_xonly_pubkey *tx_outputs = (secp256k1_xonly_pubkey*)malloc(N_OUTPUTS * sizeof(secp256k1_xonly_pubkey));
+    secp256k1_xonly_pubkey **tx_output_ptrs = (secp256k1_xonly_pubkey**)malloc(N_OUTPUTS * sizeof(secp256k1_xonly_pubkey*));
+    secp256k1_silentpayments_found_output *found_outputs = (secp256k1_silentpayments_found_output*)malloc(N_OUTPUTS * sizeof(secp256k1_silentpayments_found_output));
+    secp256k1_silentpayments_found_output **found_output_ptrs = (secp256k1_silentpayments_found_output**)malloc(N_OUTPUTS * sizeof(secp256k1_silentpayments_found_output*));
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
-    secp256k1_pubkey unlabeled_spend_pubkey;
-    struct labels_cache bob_labels_cache;
+    secp256k1_pubkey bob_unlabeled_spend_pubkey, carol_unlabeled_spend_pubkey;
+    struct labels_cache bob_labels_cache, carol_labels_cache;
     unsigned char bob_address[2][33];
-    int ret, found;
+    int ret;
     size_t i, n_found_outputs;
     double bob_scan_t0, bob_scan_t1, carol_light_t0, carol_light_t1;
+    unsigned int bob_m = 0;
+    unsigned int carol_m = 0;
 
     /* Before we can call actual API functions, we need to create a "context" */
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
@@ -172,13 +174,42 @@ int main(void) {
         return EXIT_FAILURE;
     }
     /* Randomizing the context is recommended to protect against side-channel
-     * leakage. See `secp256k1_context_randomize` in secp256k1.h for more
-     * information about it. This should never fail. */
+    * leakage. See `secp256k1_context_randomize` in secp256k1.h for more
+    * information about it. This should never fail. */
     ret = secp256k1_context_randomize(ctx, randomize);
     assert(ret);
 
     if (!tx_outputs || !tx_output_ptrs || !found_outputs || !found_output_ptrs) {
         printf("Memory allocation failed\n");
+        free(tx_outputs);
+        free(tx_output_ptrs);
+        free(found_outputs);
+        free(found_output_ptrs);
+        return EXIT_FAILURE;
+    }
+
+    /* Allocate large label caches (enough to hold one label per output) */
+    bob_labels_cache.entries_used = 0;
+    bob_labels_cache.entries_capacity = MAX_LABELS;
+    bob_labels_cache.lookup_calls = 0;
+    bob_labels_cache.lookup_hits  = 0;
+    bob_labels_cache.entries = (struct label_cache_entry*)malloc(MAX_LABELS * sizeof(struct label_cache_entry));
+    if (!bob_labels_cache.entries) {
+        printf("Label cache alloc failed (Bob)\n");
+        free(tx_outputs);
+        free(tx_output_ptrs);
+        free(found_outputs);
+        free(found_output_ptrs);
+        return EXIT_FAILURE;
+    }
+    carol_labels_cache.entries_used = 0;
+    carol_labels_cache.entries_capacity = MAX_LABELS;
+    carol_labels_cache.lookup_calls = 0;
+    carol_labels_cache.lookup_hits  = 0;
+    carol_labels_cache.entries = (struct label_cache_entry*)malloc(MAX_LABELS * sizeof(struct label_cache_entry));
+    if (!carol_labels_cache.entries) {
+        printf("Label cache alloc failed (Carol)\n");
+        free(bob_labels_cache.entries);
         free(tx_outputs);
         free(tx_output_ptrs);
         free(found_outputs);
@@ -195,58 +226,28 @@ int main(void) {
         found_output_ptrs[i] = &found_outputs[i];
     }
 
-    /*** Create a labeled silent payment address (Bob) ***/
+    /*** Base addresses (Bob & Carol): keep scan pubkeys; label spend pubkeys per-output later ***/
     {
-        size_t len = 33;
-        secp256k1_pubkey label, labeled_spend_pubkey;
-        unsigned int m = 1;
-
-        /* Load Bob's spend public key */
+        /* Bob's unlabeled spend pubkey (we'll label it per output) */
         ret = secp256k1_ec_pubkey_parse(ctx,
-            &unlabeled_spend_pubkey,
+            &bob_unlabeled_spend_pubkey,
             bob_scan_and_spend_pubkeys[1],
             33
         );
         assert(ret);
-        /* Create a (label_tweak, label) pair and add them to the labels cache.
-         *
-         * Bob MUST keep track of all of the labels he has used by adding them
-         * to the labels cache. Otherwise, he will not find outputs sent to his
-         * labeled addresses when scanning. If Bob ever loses access to his cache
-         * or forgets the total number of labels used he can create a large cache
-         * with m = 0 ... 100_000, following the recommendation from BIP0352.
-         */
-        ret = secp256k1_silentpayments_recipient_create_label(ctx,
-            &label,
-            bob_labels_cache.entries[0].label_tweak,
-            bob_scan_key,
-            m
-        );
-        if (!ret) {
-            printf("Something went wrong, event with negligible probability happened.\n");
-            return EXIT_FAILURE;
-        }
-        ret = secp256k1_ec_pubkey_serialize(ctx,
-            bob_labels_cache.entries[0].label,
-            &len,
-            &label,
-            SECP256K1_EC_COMPRESSED
-        );
-        assert(ret);
-        bob_labels_cache.entries_used = 1;
-        /* Now that the labels cache has been updated, Bob creates his labeled
-         * silent payments address and publishes it.
-         */
-        ret = secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(ctx, &labeled_spend_pubkey, &unlabeled_spend_pubkey, &label);
-        assert(ret);
         memcpy(bob_address[0], bob_scan_and_spend_pubkeys[0], 33);
-        ret = secp256k1_ec_pubkey_serialize(ctx,
-            bob_address[1],
-            &len,
-            &labeled_spend_pubkey,
-            SECP256K1_EC_COMPRESSED
+
+        /* Carol's unlabeled spend pubkey (we'll label it per output) */
+        ret = secp256k1_ec_pubkey_parse(ctx,
+            &carol_unlabeled_spend_pubkey,
+            carol_address[1],
+            33
         );
+        assert(ret);
+        /* bob_address[1] and carol_address[1] will be overwritten with a labeled
+        * spend pubkey for each output we add to sp_addresses. */
     }
+
     /*** Sending (Alice) ***/
     {
         secp256k1_keypair sender_keypairs[N_INPUTS];
@@ -254,7 +255,7 @@ int main(void) {
         secp256k1_silentpayments_recipient recipients[N_OUTPUTS];
         const secp256k1_silentpayments_recipient *recipient_ptrs[N_OUTPUTS];
         /* 2D array for holding multiple public key pairs. The second index, i.e., [2],
-         * is to represent the spend and scan public keys. */
+        * is to represent the spend and scan public keys. */
         unsigned char (*sp_addresses[N_OUTPUTS])[2][33];
         unsigned char seckey[32];
         unsigned char r;
@@ -278,10 +279,16 @@ int main(void) {
         for (i = 0; i < N_INPUTS; i++) {
             if (!fill_random(seckey, sizeof(seckey))) {
                 printf("Failed to generate randomness\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
                 return EXIT_FAILURE;
             }
             /* Try to create a keypair with a valid context, it should only fail
-             * if the secret key is zero or out of range. */
+            * if the secret key is zero or out of range. */
             if (secp256k1_keypair_create(ctx, &sender_keypairs[i], seckey)) {
                 sender_keypair_ptrs[i] = &sender_keypairs[i];
                 ret = secp256k1_keypair_xonly_pub(
@@ -293,29 +300,139 @@ int main(void) {
                 assert(ret);
             } else {
                 printf("Failed to create keypair\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
                 return EXIT_FAILURE;
             }
         }
         /*** Create the recipient objects ***/
 
-        /* Alice is sending to Bob and Carol in this transaction:
-         *
-         *     1. One output to Bob's labeled address
-         *     2. Two outputs for Carol
-         *
-         * To create multiple outputs for Carol, Alice simply passes Carol's
-         * silent payment address multiple times.
-         */
-        /* sp_addresses[0] = &carol_address;
-           sp_addresses[1] = &bob_address;
-           sp_addresses[2] = &carol_address; */
+        /* Alice is sending to Bob and Carol in this transaction.
+        * For each output we increment the recipient's label counter and
+        * derive a labeled spend pubkey on the fly.
+        */
         for (i = 0; i < N_OUTPUTS; i++) {
 
             if (!fill_random(&r, 1)) {
                 printf("Failed to generate randomness\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
                 return EXIT_FAILURE;
             }
-            sp_addresses[i] = (r & 1) ? &bob_address : &carol_address;
+
+            if (r & 1) {
+                /* --- Bob --- */
+                secp256k1_pubkey label, labeled_spend_pubkey;
+                size_t len = 33;
+                if (bob_labels_cache.entries_used >= bob_labels_cache.entries_capacity) {
+                    printf("Bob label cache full\n");
+                    free(bob_labels_cache.entries);
+                    free(carol_labels_cache.entries);
+                    free(tx_outputs);
+                    free(tx_output_ptrs);
+                    free(found_outputs);
+                    free(found_output_ptrs);
+                    return EXIT_FAILURE;
+                }
+                bob_m++;
+                ret = secp256k1_silentpayments_recipient_create_label(ctx,
+                    &label,
+                    bob_labels_cache.entries[bob_labels_cache.entries_used].label_tweak,
+                    bob_scan_key,
+                    bob_m
+                );
+                if (!ret) {
+                    printf("Label creation failed for Bob\n");
+                    free(bob_labels_cache.entries);
+                    free(carol_labels_cache.entries);
+                    free(tx_outputs);
+                    free(tx_output_ptrs);
+                    free(found_outputs);
+                    free(found_output_ptrs);
+                    return EXIT_FAILURE;
+                }
+                ret = secp256k1_ec_pubkey_serialize(ctx,
+                    bob_labels_cache.entries[bob_labels_cache.entries_used].label,
+                    &len,
+                    &label,
+                    SECP256K1_EC_COMPRESSED
+                );
+                assert(ret);
+                bob_labels_cache.entries_used++;
+                ret = secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(
+                    ctx, &labeled_spend_pubkey, &bob_unlabeled_spend_pubkey, &label
+                );
+                assert(ret);
+                len = 33;
+                ret = secp256k1_ec_pubkey_serialize(ctx,
+                    bob_address[1],
+                    &len,
+                    &labeled_spend_pubkey,
+                    SECP256K1_EC_COMPRESSED
+                );
+                assert(ret);
+                sp_addresses[i] = &bob_address;
+            } else {
+                /* --- Carol --- */
+                secp256k1_pubkey label, labeled_spend_pubkey;
+                size_t len = 33;
+                if (carol_labels_cache.entries_used >= carol_labels_cache.entries_capacity) {
+                    printf("Carol label cache full\n");
+                    free(bob_labels_cache.entries);
+                    free(carol_labels_cache.entries);
+                    free(tx_outputs);
+                    free(tx_output_ptrs);
+                    free(found_outputs);
+                    free(found_output_ptrs);
+                    return EXIT_FAILURE;
+                }
+                carol_m++;
+                ret = secp256k1_silentpayments_recipient_create_label(ctx,
+                    &label,
+                    carol_labels_cache.entries[carol_labels_cache.entries_used].label_tweak,
+                    carol_scan_key,
+                    carol_m
+                );
+                if (!ret) {
+                    printf("Label creation failed for Carol\n");
+                    free(bob_labels_cache.entries);
+                    free(carol_labels_cache.entries);
+                    free(tx_outputs);
+                    free(tx_output_ptrs);
+                    free(found_outputs);
+                    free(found_output_ptrs);
+                    return EXIT_FAILURE;
+                }
+                ret = secp256k1_ec_pubkey_serialize(ctx,
+                    carol_labels_cache.entries[carol_labels_cache.entries_used].label,
+                    &len,
+                    &label,
+                    SECP256K1_EC_COMPRESSED
+                );
+                assert(ret);
+                carol_labels_cache.entries_used++;
+                ret = secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(
+                    ctx, &labeled_spend_pubkey, &carol_unlabeled_spend_pubkey, &label
+                );
+                assert(ret);
+                len = 33;
+                ret = secp256k1_ec_pubkey_serialize(ctx,
+                    carol_address[1],
+                    &len,
+                    &labeled_spend_pubkey,
+                    SECP256K1_EC_COMPRESSED
+                );
+                assert(ret);
+                sp_addresses[i] = &carol_address;
+            }
 
             ret = secp256k1_ec_pubkey_parse(ctx,
                 &recipients[i].scan_pubkey,
@@ -329,15 +446,21 @@ int main(void) {
             );
             if (!ret) {
                 printf("Something went wrong, this is not a valid silent payments address.\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
                 return EXIT_FAILURE;
             }
 
             /* Alice creates the recipient objects and adds the index of the
-             * original ordering (the ordering of the `sp_addresses` array) to
-             * each object. This index is used to return the generated outputs
-             * in the original ordering so that Alice can match up the generated
-             * outputs with the correct amounts.
-             */
+            * original ordering (the ordering of the `sp_addresses` array) to
+            * each object. This index is used to return the generated outputs
+            * in the original ordering so that Alice can match up the generated
+            * outputs with the correct amounts.
+            */
             recipients[i].index = i;
             recipient_ptrs[i] = &recipients[i];
         }
@@ -350,26 +473,16 @@ int main(void) {
         );
         if (!ret) {
             printf("Something went wrong, a recipient provided an invalid address.\n");
+            free(bob_labels_cache.entries);
+            free(carol_labels_cache.entries);
+            free(tx_outputs);
+            free(tx_output_ptrs);
+            free(found_outputs);
+            free(found_output_ptrs);
             return EXIT_FAILURE;
         }
-        /* printf("Alice created the following outputs for Bob and Carol:\n");
-        for (i = 0; i < N_OUTPUTS; i++) {
-            printf("    ");
-            ret = secp256k1_xonly_pubkey_serialize(ctx,
-                serialized_xonly,
-                &tx_outputs[i]
-            );
-            assert(ret);
-            print_hex(serialized_xonly, sizeof(serialized_xonly));
-        } */
         /* It's best practice to try to clear secrets from memory after using
-         * them. This is done because some bugs can allow an attacker to leak
-         * memory, for example through "out of bounds" array access (see
-         * Heartbleed), or the OS swapping them to disk. Hence, we overwrite the
-         * secret key buffer with zeros.
-         *
-         * Here we are preventing these writes from being optimized out, as any
-         * good compiler will remove any writes that aren't used. */
+        * them. */
         secure_erase(seckey, sizeof(seckey));
         for (i = 0; i < N_INPUTS; i++) {
             secure_erase(&sender_keypairs[i], sizeof(sender_keypairs[i]));
@@ -380,25 +493,7 @@ int main(void) {
     {
         unsigned char light_client_data33[33];
         {
-            /*** Scanning as a full node (Bob) ***
-             *
-             * Since Bob has access to the full transaction, scanning is simple:
-             *
-             *     1. Collect the relevant prevouts from the transaction and call
-             *        `secp256k1_silentpayments_recipient_prevouts_summary_create`
-             *     2. Call `secp256k1_silentpayments_recipient_scan_outputs`
-             *
-             * Bob collects the prevouts data from the transaction inputs and
-             * creates a `secp256k1_silentpayments_prevouts_summary` object. He uses
-             * this for his own scanning and also serializes the `prevouts_summary`
-             * object to send to light clients. We will use this later for
-             * Carol, who is scanning as a light client. Note, anyone can create
-             * and provide these `prevouts_summary` objects, i.e. you don't need to be
-             * a silent payments wallet, just someone interested in providing this
-             * data to light clients, e.g. a wallet service provider. In our
-             * example, Bob is scanning for himself but also sharing this data
-             * with light clients.
-             */
+            /*** Scanning as a full node (Bob) ***/
             ret = secp256k1_silentpayments_recipient_prevouts_summary_create(ctx,
                 &prevouts_summary,
                 smallest_outpoint,
@@ -406,10 +501,14 @@ int main(void) {
                 NULL, 0
             );
             if (!ret) {
-                /* We need to always check that the prevouts data object is valid
-                 * before proceeding.
-                 */
                 printf("This transaction is not valid for silent payments, skipping.\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
+                secp256k1_context_destroy(ctx);
                 return EXIT_SUCCESS;
             }
             /* Serialize the prevouts data object for later use. */
@@ -422,7 +521,6 @@ int main(void) {
             assert(ret);
 
             /* Scan the transaction */
-            found = 0;
             n_found_outputs = 0;
             bob_scan_t0 = now_seconds();
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
@@ -430,12 +528,19 @@ int main(void) {
                 (const secp256k1_xonly_pubkey * const *)tx_output_ptrs, N_OUTPUTS,
                 bob_scan_key,
                 &prevouts_summary,
-                &unlabeled_spend_pubkey,
+                &bob_unlabeled_spend_pubkey,
                 label_lookup, &bob_labels_cache /* NULL, NULL for no labels */
             );
             bob_scan_t1 = now_seconds();
             if (!ret) {
                 printf("This transaction is not valid for silent payments, skipping.\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
+                secp256k1_context_destroy(ctx);
                 return EXIT_SUCCESS;
             }
             printf("Bob's full node scan took %.3f ms\n", (bob_scan_t1 - bob_scan_t0) * 1000.0);
@@ -445,28 +550,14 @@ int main(void) {
                 unsigned char full_seckey[32];
 
                 printf("\n");
-                /* printf("Bob found the following outputs: \n"); */
                 for (i = 0; i < n_found_outputs; i++) {
-                    /* printf("    "); */
                     ret = secp256k1_xonly_pubkey_serialize(ctx,
                         serialized_xonly,
                         &found_outputs[i].output
                     );
                     assert(ret);
-                    /* print_hex(serialized_xonly, sizeof(serialized_xonly)); */
 
-                    /* Verify that this output is spendable by Bob by reconstructing the full
-                     * secret key for the xonly output.
-                     *
-                     * This is done by adding the tweak from the transaction to Bob's spend key.
-                     * If the output was sent to a labeled address, the label tweak has already
-                     * been added to the tweak in `secp256k1_silentpayments_found_output`.
-                     *
-                     * To verify that we are able to sign for this output, it is sufficient to
-                     * check that the public key generated from `full_seckey` matches the output
-                     * in the transaction. For a full example on signing for a taproot ouput,
-                     * see `examples/schnorr.c`.
-                     */
+                    /* Verify spendability by reconstructing the full secret key. */
                     memcpy(&full_seckey, &bob_spend_key, 32);
                     ret = secp256k1_ec_seckey_tweak_add(ctx, full_seckey, found_outputs[i].tweak);
                     ret &= secp256k1_keypair_create(ctx, &kp, full_seckey);
@@ -476,13 +567,6 @@ int main(void) {
                         NULL,
                         &kp
                     );
-                    /* We assert here because the only way the seckey_tweak_add operation can fail
-                     * is if the tweak is the negation of Bob's spend key.
-                     *
-                     * We also assert that the generated public key matches the transaction output,
-                     * as it should be impossible for a mismatch at this point considering the
-                     * scanning function completed without errors and indicated found outputs.
-                     */
                     assert(ret);
                     assert(secp256k1_xonly_pubkey_cmp(ctx, &xonly_output, &found_outputs[i].output) == 0);
                     secure_erase(full_seckey, sizeof(full_seckey));
@@ -492,31 +576,8 @@ int main(void) {
             }
         }
         {
-            /*** Scanning as a light client (Carol) ***
-             *
-             * Being a light client, Carol likely does not have access to the
-             * transaction inputs and prevout information, so she uses the
-             * `prevouts_summary` object created by Bob's full node earlier. This
-             * serialized `prevouts_summary` object contains everything she needs for
-             * generating the shared secret, i.e., `input_hash * prevouts_pubkey_sum`.
-             *
-             * Additionally, she likely does not have access to the transaction outputs.
-             * This means she will need to first generate outputs, check if they exist
-             * in the UTXO set (e.g. BIP158 or some other means of querying), and
-             * proceed to download the full transaction if there is a match.
-             *
-             * Once she has the full transaction, she scans with
-             * `secp256k1_silentpayments_recipient_scan_outputs` to find all of
-             * the outputs and extract the tweaks needed for spending later.
-             */
+            /*** Scanning as a light client (Carol) ***/
 
-            /* Load Carol's spend public key. */
-            ret = secp256k1_ec_pubkey_parse(ctx,
-                &unlabeled_spend_pubkey,
-                carol_address[1],
-                33
-            );
-            assert(ret);
             /* Parse the serialized prevouts_summary object. */
             ret = secp256k1_silentpayments_recipient_prevouts_summary_parse(ctx,
                 &prevouts_summary,
@@ -526,16 +587,22 @@ int main(void) {
             if (!ret) {
                 printf("\n");
                 printf("This transaction is not valid for silent payments, skipping.");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
+                secp256k1_context_destroy(ctx);
                 return EXIT_SUCCESS;
             }
-            found = 0;
             n_found_outputs = 0;
             {
                 secp256k1_xonly_pubkey *potential_output_ptrs[1];
                 secp256k1_xonly_pubkey potential_outputs[1];
                 const secp256k1_pubkey *spend_pubkey_ptrs[1];
 
-                spend_pubkey_ptrs[0] = &unlabeled_spend_pubkey;
+                spend_pubkey_ptrs[0] = &carol_unlabeled_spend_pubkey;
                 potential_output_ptrs[0] = &potential_outputs[0];
                 carol_light_t0 = now_seconds();
 
@@ -548,22 +615,18 @@ int main(void) {
                 );
                 if (!ret) {
                     printf("This transaction is not valid for silent payments, skipping.\n");
+                    free(bob_labels_cache.entries);
+                    free(carol_labels_cache.entries);
+                    free(tx_outputs);
+                    free(tx_output_ptrs);
+                    free(found_outputs);
+                    free(found_output_ptrs);
+                    secp256k1_context_destroy(ctx);
                     return EXIT_SUCCESS;
                 }
-                /* At this point, we check that the UTXO exists with a light
-                 * client protocol. For this example, we'll just iterate
-                 * through the list of transaction outputs.
-                 *
-                 * If we generate an output and it does not exist in the
-                 * UTXO set, we are done scanning this transaction. It is
-                 * sufficient to stop after the first match, since we will be
-                 * doing a full scan of the transaction once we have access to
-                 * all of the outputs.
-                 */
-                found = 0;
+                /* Existence check (light client style). */
                 for (i = 0; i < N_OUTPUTS; i++) {
                     if (secp256k1_xonly_pubkey_cmp(ctx, &potential_outputs[0], &tx_outputs[i]) == 0) {
-                        found = 1;
                         break;
                     }
                 }
@@ -573,47 +636,55 @@ int main(void) {
                     (carol_light_t1 - carol_light_t0) * 1000.0);
             }
 
-            if (found) {
-                /* Carol now needs to request the full transaction to do a complete scan. */
-                n_found_outputs = 0;
-                ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
-                    found_output_ptrs, &n_found_outputs,
-                    (const secp256k1_xonly_pubkey * const *)tx_output_ptrs, N_OUTPUTS,
-                    carol_scan_key,
-                    &prevouts_summary,
-                    &unlabeled_spend_pubkey,
-                    NULL, NULL /* NULL, NULL for no labels */
-                );
-                if (!ret) {
-                    printf("This transaction is not valid for silent payments, skipping.\n");
-                    return EXIT_SUCCESS;
+            /* For labeled addresses, go straight to a full scan with label lookup. */
+            n_found_outputs = 0;
+            ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
+                found_output_ptrs, &n_found_outputs,
+                (const secp256k1_xonly_pubkey * const *)tx_output_ptrs, N_OUTPUTS,
+                carol_scan_key,
+                &prevouts_summary,
+                &carol_unlabeled_spend_pubkey,
+                label_lookup, &carol_labels_cache /* use labels for Carol */
+            );
+            if (!ret) {
+                printf("This transaction is not valid for silent payments, skipping.\n");
+                free(bob_labels_cache.entries);
+                free(carol_labels_cache.entries);
+                free(tx_outputs);
+                free(tx_output_ptrs);
+                free(found_outputs);
+                free(found_output_ptrs);
+                secp256k1_context_destroy(ctx);
+                return EXIT_SUCCESS;
+            }
+            if (n_found_outputs > 0) {
+                printf("\n");
+                for (i = 0; i < n_found_outputs; i++) {
+                    ret = secp256k1_xonly_pubkey_serialize(ctx,
+                        serialized_xonly,
+                        &found_outputs[i].output
+                    );
+                    assert(ret);
                 }
-                if (n_found_outputs > 0) {
-                    /* Carol would spend these outputs the same as Bob, by tweaking her
-                     * spend key with the tweak corresponding to the found output. See above
-                     * for an example for Bob's outputs. */
-                    printf("\n");
-                    /* printf("Carol found the following outputs: \n"); */
-                    for (i = 0; i < n_found_outputs; i++) {
-                        /* printf("    "); */
-                        ret = secp256k1_xonly_pubkey_serialize(ctx,
-                            serialized_xonly,
-                            &found_outputs[i].output
-                        );
-                        assert(ret);
-                        /* print_hex(serialized_xonly, sizeof(serialized_xonly)); */
-                    }
-                } else {
-                    printf("Carol did not find any outputs in this transaction.\n");
-                }
+            } else {
+                printf("Carol did not find any outputs in this transaction.\n");
             }
         }
     }
+
+    /* === Final label usage summary === */
+    printf("\n=== Label summary ===\n");
+    printf("Bob:   used %zu labels | lookup calls %zu | matches %zu\n",
+        bob_labels_cache.entries_used, bob_labels_cache.lookup_calls, bob_labels_cache.lookup_hits);
+    printf("Carol: used %zu labels | lookup calls %zu | matches %zu\n",
+        carol_labels_cache.entries_used, carol_labels_cache.lookup_calls, carol_labels_cache.lookup_hits);
 
     free(tx_outputs);
     free(tx_output_ptrs);
     free(found_outputs);
     free(found_output_ptrs);
+    free(bob_labels_cache.entries);
+    free(carol_labels_cache.entries);
 
     /* This will clear everything from the context and free the memory */
     secp256k1_context_destroy(ctx);
