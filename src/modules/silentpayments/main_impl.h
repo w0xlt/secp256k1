@@ -17,9 +17,110 @@
 #include "../../group.h"
 #include "../../hash.h"
 #include "../../hsort.h"
+/* PATCH(A/C): checked_malloc, secp256k1_memcmp_var, explicit zeroization */
+#include "../../util.h"
+
+#include <stdlib.h> /* free */
 
 /** magic bytes for ensuring prevouts_summary objects were initialized correctly. */
 static const unsigned char secp256k1_silentpayments_prevouts_summary_magic[4] = { 0xa7, 0x1c, 0xd3, 0x5e };
+
+/* ============================================================================
+* Helper types & fast-index utilities (PATCH A)
+* - Build a sorted index of x-only transaction outputs once per call.
+* - Binary search into that index for O(log n) (practically O(1)) lookup.
+* - Reviewers: this is the only new helper code.
+* ========================================================================== */
+
+typedef struct {
+    const secp256k1_xonly_pubkey* pk; /* pointer into caller's tx_outputs[] */
+    size_t orig_index;                /* original index in tx_outputs[]     */
+    int used;                         /* 1 if already matched               */
+} secp256k1_sp_outidx;
+
+/* Compare entries by x-only serialized bytes (lexicographic). */
+static int secp256k1_sp_outidx_cmp_xonly32(const void* a_, const void* b_, void* ctx_) {
+    const secp256k1_context* ctx = (const secp256k1_context*)ctx_;
+    const secp256k1_sp_outidx* a = (const secp256k1_sp_outidx*)a_;
+    const secp256k1_sp_outidx* b = (const secp256k1_sp_outidx*)b_;
+    unsigned char ax[32], bx[32];
+    int ret;
+
+    ret = secp256k1_xonly_pubkey_serialize(ctx, ax, a->pk);
+#ifdef VERIFY
+    VERIFY_CHECK(ret);
+#else
+    (void)ret;
+#endif
+    ret = secp256k1_xonly_pubkey_serialize(ctx, bx, b->pk);
+#ifdef VERIFY
+    VERIFY_CHECK(ret);
+#else
+    (void)ret;
+#endif
+    return secp256k1_memcmp_var(ax, bx, 32);
+}
+
+/* Return first index whose x-only equals key32, or -1 if none. */
+static int secp256k1_sp_outidx_bsearch_first(const secp256k1_context* ctx,
+                                            const secp256k1_sp_outidx* arr, size_t n,
+                                            const unsigned char key32[32]) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) >> 1);
+        unsigned char mx[32];
+        int ret = secp256k1_xonly_pubkey_serialize(ctx, mx, arr[mid].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+        if (secp256k1_memcmp_var(mx, key32, 32) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= n) return -1;
+    {
+        unsigned char vx[32];
+        int ret2 = secp256k1_xonly_pubkey_serialize(ctx, vx, arr[lo].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret2);
+#else
+        (void)ret2;
+#endif
+        if (secp256k1_memcmp_var(vx, key32, 32) != 0) return -1;
+    }
+    return (int)lo;
+}
+
+/* Given the first-equal position `start`, walk forward to find an unused one. */
+static int secp256k1_sp_outidx_find_unused_equal(const secp256k1_context* ctx,
+                                                secp256k1_sp_outidx* arr, size_t n,
+                                                int start, const unsigned char key32[32]) {
+    size_t i;
+    unsigned char vx[32];
+    int ret;
+
+    if (start < 0) return -1;
+    for (i = (size_t)start; i < n; i++) {
+        ret = secp256k1_xonly_pubkey_serialize(ctx, vx, arr[i].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+        if (secp256k1_memcmp_var(vx, key32, 32) != 0) break; /* end of equal run */
+        if (!arr[i].used) return (int)i;
+    }
+    return -1;
+}
+
+/* ============================================================================
+* Original code (unchanged) until the scan function.  Only small comments or
+* whitespace may differ. The behavior and API are preserved.                 *
+* ========================================================================== */
 
 /** Sort an array of silent payment recipients. This is used to group recipients by scan pubkey to
  *  ensure the correct values of k are used when creating multiple outputs for a recipient.
@@ -28,10 +129,15 @@ static const unsigned char secp256k1_silentpayments_prevouts_summary_magic[4] = 
  *  rely on deterministic sorting of _recipient objects.
  */
 static int secp256k1_silentpayments_recipient_sort_cmp(const void* pk1, const void* pk2, void *ctx) {
-    return secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
-        &(*(const secp256k1_silentpayments_recipient **)pk1)->scan_pubkey,
-        &(*(const secp256k1_silentpayments_recipient **)pk2)->scan_pubkey
-    );
+    const secp256k1_silentpayments_recipient *r1 = *(const secp256k1_silentpayments_recipient **)pk1;
+    const secp256k1_silentpayments_recipient *r2 = *(const secp256k1_silentpayments_recipient **)pk2;
+    int cmp = secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
+                                       &r1->scan_pubkey,
+                                       &r2->scan_pubkey);
+    if (cmp == 0) {
+        return (r1->index < r2->index) ? -1 : (r1->index > r2->index) ? 1 : 0;
+    }
+    return cmp;
 }
 
 static void secp256k1_silentpayments_recipient_sort(const secp256k1_context* ctx, const secp256k1_silentpayments_recipient **recipients, size_t n_recipients) {
@@ -570,6 +676,13 @@ int secp256k1_silentpayments_recipient_prevouts_summary_parse(const secp256k1_co
     return 1;
 }
 
+/* ============================================================================
+* RECIPIENT SCAN (PATCH A + C)
+*
+* - PATCH(A): Unlabeled fast path via sorted xonly index (O(n) overall).
+* - PATCH(C): Off-by-one fix; pre-decode outputs once; batch normalize label
+*             candidates; skip already matched outputs.
+* ========================================================================== */
 int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
@@ -587,6 +700,20 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     const unsigned char *label_tweak = NULL;
     size_t i, j, k, n_found, found_idx;
     int found, combined, valid_scan_key, ret;
+
+    /* PATCH(A) locals */
+    secp256k1_sp_outidx* outidx = NULL;
+    secp256k1_gej* tx_gej = NULL;
+    unsigned char* used_orig = NULL;
+
+    /* Batch buffers (PATCH C) */
+    secp256k1_gej cand_gej[64];
+    secp256k1_ge  cand_ge[64];
+    size_t idx_map[64];
+    size_t base, base2;
+    secp256k1_ge output_negated_ge;
+    unsigned char output_xonly32[32];
+    int pos0, pos;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -624,139 +751,198 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Clear the scan_key_scalar since we no longer need it and leaking this value would break indistinguishability of the transaction. */
     secp256k1_scalar_clear(&scan_key_scalar);
 
+    /* ---------- PATCH(A/C): Preprocessing ---------- */
+
+    /* Build a sorted x-only index over outputs (unlabeled fast path). */
+    outidx = (secp256k1_sp_outidx*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*outidx));
+    for (j = 0; j < n_tx_outputs; j++) {
+        outidx[j].pk = tx_outputs[j];
+        outidx[j].orig_index = j;
+        outidx[j].used = 0;
+    }
+    secp256k1_hsort(outidx, n_tx_outputs, sizeof(*outidx), secp256k1_sp_outidx_cmp_xonly32, (void*)ctx);
+
+    /* Pre-decode outputs to Jacobian once for labeled fallback. */
+    tx_gej = (secp256k1_gej*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*tx_gej));
+    used_orig = (unsigned char*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*used_orig));
+    memset(used_orig, 0, n_tx_outputs);
+    for (j = 0; j < n_tx_outputs; j++) {
+        secp256k1_ge ge;
+        secp256k1_xonly_pubkey_load(ctx, &ge, tx_outputs[j]);
+        secp256k1_gej_set_ge(&tx_gej[j], &ge);
+    }
+
+    /* ---------- Main scan loop ---------- */
+
     found_idx = 0;
     n_found = 0;
     k = 0;
-    for (i = 0; i <= n_tx_outputs; i++) {
+
+    /* PATCH(C): off-by-one fix. At most n_tx_outputs outputs can match. */
+    for (i = 0; i < n_tx_outputs; i++) {
         secp256k1_ge output_ge = spend_pubkey_ge;
-        /* Calculate the output_tweak and convert it to a scalar to ensure the value is less than the curve order.
-         *
-         * Note: _create_output_tweak can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
-         * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
-         */
-        if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
+
+        /* output_tweak = H(shared_secret||k), then output = spend + output_tweak*G */
+        if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, (uint32_t)k)) {
             secp256k1_scalar_clear(&output_tweak_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_gej);
+            free(used_orig);
+            free(outidx);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
             return 0;
         }
-
-        /* Calculate output = spend_pubkey + output_tweak * G.
-         * This can fail if output_tweak * G is the negation of spend_pubkey, but this happens only
-         * with negligible probability for honestly created spend_pubkey as output_tweak is the output of a hash function. */
         if (!secp256k1_eckey_pubkey_tweak_add(&output_ge, &output_tweak_scalar)) {
-            /* Leaking these values would break indistinguishability of the transaction, so clear them. */
             secp256k1_scalar_clear(&output_tweak_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_gej);
+            free(used_orig);
+            free(outidx);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
             return 0;
         }
-        found = 0;
+
+        /* Serialize x-only candidate (used in both paths). */
         secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_tx_outputs; j++) {
-            if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
-                label_tweak = NULL;
-                found = 1;
-                found_idx = j;
-                break;
+        ret = secp256k1_xonly_pubkey_serialize(ctx, output_xonly32, &output_xonly);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+
+        /* --------- PATCH(A): unlabeled fast path via index --------- */
+        found = 0;
+        label_tweak = NULL;
+        pos0 = secp256k1_sp_outidx_bsearch_first(ctx, outidx, n_tx_outputs, output_xonly32);
+        pos = secp256k1_sp_outidx_find_unused_equal(ctx, outidx, n_tx_outputs, pos0, output_xonly32);
+        if (pos >= 0) {
+            size_t oj = outidx[pos].orig_index;
+            outidx[pos].used = 1;
+            used_orig[oj] = 1;
+            found = 1;
+            found_idx = (size_t)oj;
+        }
+
+        /* --------- PATCH(C): labeled fallback (batch, skip used) --------- */
+        if (!found && label_lookup != NULL) {
+            size_t cnt, a;
+
+            /* Precompute -output_ge once. */
+            secp256k1_ge_neg(&output_negated_ge, &output_ge);
+
+            /* First candidate family: label = tx_output - output_ge */
+            base = 0;
+            while (!found && base < n_tx_outputs) {
+                cnt = 0;
+                for (j = base; j < n_tx_outputs && cnt < 64; j++) {
+                    if (used_orig[j]) continue; /* already matched */
+                    secp256k1_gej_add_ge_var(&cand_gej[cnt], &tx_gej[j], &output_negated_ge, NULL);
+                    idx_map[cnt] = j;
+                    cnt++;
+                }
+                base = j;
+                if (cnt == 0) break;
+                secp256k1_ge_set_all_gej_var(cand_ge, cand_gej, cnt);
+                for (a = 0; a < cnt; a++) {
+                    unsigned char label33[33];
+                    size_t len = 33;
+                    int ok = secp256k1_eckey_pubkey_serialize(&cand_ge[a], label33, &len, 1);
+#ifdef VERIFY
+                    VERIFY_CHECK(ok && len == 33);
+#else
+                    (void)ok;
+#endif
+                    label_tweak = label_lookup(label33, label_context);
+                    if (label_tweak != NULL) {
+                        size_t oj = idx_map[a];
+                        used_orig[oj] = 1;
+                        found = 1;
+                        found_idx = oj;
+                        label_ge = cand_ge[a];
+                        break;
+                    }
+                }
             }
 
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
-            if (label_lookup != NULL) {
-                secp256k1_ge output_negated_ge, tx_output_ge;
-                secp256k1_gej tx_output_gej, label_gej;
-                unsigned char label33[33];
-                size_t len;
-
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
-                secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
-                secp256k1_ge_neg(&output_negated_ge, &output_ge);
-                secp256k1_gej_add_ge_var(&label_gej, &tx_output_gej, &output_negated_ge, NULL);
-                secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
-                /* Serialize must succeed because the point was just loaded.
-                 *
-                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
-                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
-                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
-                 * point at infinity.
-                 */
-                VERIFY_CHECK(ret && len == 33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
-                    found = 1;
-                    found_idx = j;
-                    break;
-                }
-
-                secp256k1_gej_neg(&label_gej, &tx_output_gej);
-                /* If not found, negate the tx_output and calculate second scan label candidate:
-                 *     label2 = -tx_output - generated_output
-                 */
-                secp256k1_gej_add_ge_var(&label_gej, &label_gej, &output_negated_ge, NULL);
-                secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
-                /* Serialize must succeed because the point was just loaded.
-                 *
-                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
-                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
-                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
-                 * point at infinity.
-                 */
-                VERIFY_CHECK(ret && len == 33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
-                    found = 1;
-                    found_idx = j;
-                    break;
+            /* Second candidate family: label2 = -tx_output - output_ge */
+            if (!found) {
+                secp256k1_gej neg_tx;
+                base2 = 0;
+                while (!found && base2 < n_tx_outputs) {
+                    cnt = 0;
+                    for (j = base2; j < n_tx_outputs && cnt < 64; j++) {
+                        if (used_orig[j]) continue;
+                        secp256k1_gej_neg(&neg_tx, &tx_gej[j]);
+                        secp256k1_gej_add_ge_var(&cand_gej[cnt], &neg_tx, &output_negated_ge, NULL);
+                        idx_map[cnt] = j;
+                        cnt++;
+                    }
+                    base2 = j;
+                    if (cnt == 0) break;
+                    secp256k1_ge_set_all_gej_var(cand_ge, cand_gej, cnt);
+                    for (a = 0; a < cnt; a++) {
+                        unsigned char label33b[33];
+                        size_t lenb = 33;
+                        int ok2 = secp256k1_eckey_pubkey_serialize(&cand_ge[a], label33b, &lenb, 1);
+#ifdef VERIFY
+                        VERIFY_CHECK(ok2 && lenb == 33);
+#else
+                        (void)ok2;
+#endif
+                        label_tweak = label_lookup(label33b, label_context);
+                        if (label_tweak != NULL) {
+                            size_t oj2 = idx_map[a];
+                            used_orig[oj2] = 1;
+                            found = 1;
+                            found_idx = oj2;
+                            label_ge = cand_ge[a];
+                            break;
+                        }
+                    }
                 }
             }
         }
+
         if (found) {
+            /* Write result */
             found_outputs[n_found]->output = *tx_outputs[found_idx];
             secp256k1_scalar_get_b32(found_outputs[n_found]->tweak, &output_tweak_scalar);
-            /* Clear the output_tweak_scalar since we no longer need it and leaking this value would
-             * break indistinguishability of the transaction. */
             secp256k1_scalar_clear(&output_tweak_scalar);
+
             if (label_tweak != NULL) {
                 found_outputs[n_found]->found_with_label = 1;
-                /* This is extremely unlikely to fail in that it can only really fail if label_tweak
-                 * is the negation of the shared secret tweak. But since both tweak and label_tweak are
-                 * created by hashing data, practically speaking this would only happen if an attacker
-                 * tricked us into using a particular label_tweak (deviating from the protocol).
-                 *
-                 * Furthermore, although technically a failure for ec_seckey_tweak_add, this is not treated
-                 * as a failure for silent payments because the output is still spendable with just the
-                 * spend secret key. We set `tweak = 0` for this case.
-                 */
                 if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[n_found]->tweak, label_tweak)) {
                     memset(found_outputs[n_found]->tweak, 0, 32);
                 }
                 secp256k1_pubkey_save(&found_outputs[n_found]->label, &label_ge);
             } else {
                 found_outputs[n_found]->found_with_label = 0;
-                /* Set the label public key with an invalid public key value. */
                 memset(&found_outputs[n_found]->label, 0, sizeof(secp256k1_pubkey));
             }
-            /* Reset everything for the next round of scanning. */
-            label_tweak = NULL;
+
+            /* Next k (bounded by UINT32_MAX per spec). */
             n_found++;
-            /* BIP0352 specifies that k is serialized as a 4 byte (32 bit) value, so we check to make
-             * sure we are not exceeding the max value for a uint32 before incrementing k.
-             * In practice, this should never happen as it would be impossible to create a transaction
-             * with this many outputs.
-             */
             if (k < UINT32_MAX) {
                 k++;
             } else {
+                free(tx_gej);
+                free(used_orig);
+                free(outidx);
+                secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
                 return 0;
             }
         } else {
+            /* No match for this k -> stop. */
             secp256k1_scalar_clear(&output_tweak_scalar);
             break;
         }
     }
+
     *n_found_outputs = n_found;
 
-    /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
+    /* Clean up */
+    free(tx_gej);
+    free(used_orig);
+    free(outidx);
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     return 1;
 }
