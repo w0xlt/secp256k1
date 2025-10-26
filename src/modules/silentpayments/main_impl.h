@@ -129,10 +129,15 @@ static int secp256k1_sp_outidx_find_unused_equal(const secp256k1_context* ctx,
  *  rely on deterministic sorting of _recipient objects.
  */
 static int secp256k1_silentpayments_recipient_sort_cmp(const void* pk1, const void* pk2, void *ctx) {
-    return secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
-        &(*(const secp256k1_silentpayments_recipient **)pk1)->scan_pubkey,
-        &(*(const secp256k1_silentpayments_recipient **)pk2)->scan_pubkey
-    );
+    const secp256k1_silentpayments_recipient *r1 = *(const secp256k1_silentpayments_recipient **)pk1;
+    const secp256k1_silentpayments_recipient *r2 = *(const secp256k1_silentpayments_recipient **)pk2;
+    int cmp = secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
+                                       &r1->scan_pubkey,
+                                       &r2->scan_pubkey);
+    if (cmp == 0) {
+        return (r1->index < r2->index) ? -1 : (r1->index > r2->index) ? 1 : 0;
+    }
+    return cmp;
 }
 
 static void secp256k1_silentpayments_recipient_sort(const secp256k1_context* ctx, const secp256k1_silentpayments_recipient **recipients, size_t n_recipients) {
