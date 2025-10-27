@@ -32,4 +32,7 @@ endif()
 
 if(SECP256K1_ENABLE_MODULE_SILENTPAYMENTS)
   add_example(silentpayments)
+  add_example(silentpayments_shuffle_labels)
+  add_example(silentpayments_mixed_1)
+  add_example(silentpayments_mixed_2)
 endif()
