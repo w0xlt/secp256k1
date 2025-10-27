@@ -17,9 +17,105 @@
 #include "../../group.h"
 #include "../../hash.h"
 #include "../../hsort.h"
+/* PATCH(A/C): checked_malloc, secp256k1_memcmp_var, explicit zeroization */
+#include "../../util.h"
+
+#include <stdlib.h> /* free */
 
 /** magic bytes for ensuring prevouts_summary objects were initialized correctly. */
 static const unsigned char secp256k1_silentpayments_prevouts_summary_magic[4] = { 0xa7, 0x1c, 0xd3, 0x5e };
+
+/* ============================================================================
+* Helper types & fast-index utilities (PATCH A)
+* - Build a sorted index of x-only transaction outputs once per call.
+* - Binary search into that index for O(log n) (practically O(1)) lookup.
+* - Reviewers: this is the only new helper code.
+* ========================================================================== */
+
+typedef struct {
+    const secp256k1_xonly_pubkey* pk; /* pointer into caller's tx_outputs[] */
+    size_t orig_index;                /* original index in tx_outputs[]     */
+    int used;                         /* 1 if already matched               */
+} secp256k1_sp_outidx;
+
+/* Compare entries by x-only serialized bytes (lexicographic). */
+static int secp256k1_sp_outidx_cmp_xonly32(const void* a_, const void* b_, void* ctx_) {
+    const secp256k1_context* ctx = (const secp256k1_context*)ctx_;
+    const secp256k1_sp_outidx* a = (const secp256k1_sp_outidx*)a_;
+    const secp256k1_sp_outidx* b = (const secp256k1_sp_outidx*)b_;
+    unsigned char ax[32], bx[32];
+    int ret;
+
+    ret = secp256k1_xonly_pubkey_serialize(ctx, ax, a->pk);
+#ifdef VERIFY
+    VERIFY_CHECK(ret);
+#else
+    (void)ret;
+#endif
+    ret = secp256k1_xonly_pubkey_serialize(ctx, bx, b->pk);
+#ifdef VERIFY
+    VERIFY_CHECK(ret);
+#else
+    (void)ret;
+#endif
+    return secp256k1_memcmp_var(ax, bx, 32);
+}
+
+/* Return first index whose x-only equals key32, or -1 if none. */
+static int secp256k1_sp_outidx_bsearch_first(const secp256k1_context* ctx,
+                                            const secp256k1_sp_outidx* arr, size_t n,
+                                            const unsigned char key32[32]) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) >> 1);
+        unsigned char mx[32];
+        int ret = secp256k1_xonly_pubkey_serialize(ctx, mx, arr[mid].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+        if (secp256k1_memcmp_var(mx, key32, 32) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= n) return -1;
+    {
+        unsigned char vx[32];
+        int ret2 = secp256k1_xonly_pubkey_serialize(ctx, vx, arr[lo].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret2);
+#else
+        (void)ret2;
+#endif
+        if (secp256k1_memcmp_var(vx, key32, 32) != 0) return -1;
+    }
+    return (int)lo;
+}
+
+/* Given the first-equal position `start`, walk forward to find an unused one. */
+static int secp256k1_sp_outidx_find_unused_equal(const secp256k1_context* ctx,
+                                                secp256k1_sp_outidx* arr, size_t n,
+                                                int start, const unsigned char key32[32]) {
+    size_t i;
+    unsigned char vx[32];
+    int ret;
+
+    if (start < 0) return -1;
+    for (i = (size_t)start; i < n; i++) {
+        ret = secp256k1_xonly_pubkey_serialize(ctx, vx, arr[i].pk);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+        if (secp256k1_memcmp_var(vx, key32, 32) != 0) break; /* end of equal run */
+        if (!arr[i].used) return (int)i;
+    }
+    return -1;
+}
 
 /** Sort an array of silent payment recipients. This is used to group recipients by scan pubkey to
  *  ensure the correct values of k are used when creating multiple outputs for a recipient.
@@ -28,10 +124,15 @@ static const unsigned char secp256k1_silentpayments_prevouts_summary_magic[4] = 
  *  rely on deterministic sorting of _recipient objects.
  */
 static int secp256k1_silentpayments_recipient_sort_cmp(const void* pk1, const void* pk2, void *ctx) {
-    return secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
-        &(*(const secp256k1_silentpayments_recipient **)pk1)->scan_pubkey,
-        &(*(const secp256k1_silentpayments_recipient **)pk2)->scan_pubkey
-    );
+    const secp256k1_silentpayments_recipient *r1 = *(const secp256k1_silentpayments_recipient **)pk1;
+    const secp256k1_silentpayments_recipient *r2 = *(const secp256k1_silentpayments_recipient **)pk2;
+    int cmp = secp256k1_ec_pubkey_cmp((secp256k1_context *)ctx,
+                                       &r1->scan_pubkey,
+                                       &r2->scan_pubkey);
+    if (cmp == 0) {
+        return (r1->index < r2->index) ? -1 : (r1->index > r2->index) ? 1 : 0;
+    }
+    return cmp;
 }
 
 static void secp256k1_silentpayments_recipient_sort(const secp256k1_context* ctx, const secp256k1_silentpayments_recipient **recipients, size_t n_recipients) {
@@ -570,6 +671,19 @@ int secp256k1_silentpayments_recipient_prevouts_summary_parse(const secp256k1_co
     return 1;
 }
 
+/* ============================================================================
+* RECIPIENT SCAN (PATCH A + C)
+*
+* - PATCH(A): Unlabeled fast path via sorted xonly index (O(n) overall).
+* - PATCH(C): Off-by-one fix; pre-decode outputs once; batch normalize label
+*             candidates; skip already matched outputs.
+* RECIPIENT SCAN with moving search heads (PATCH D)
+*
+* - Keeps persistent cursors for labeled fallback so we don't restart at 0
+*   for every k. Cursors advance and wrap once at most per k.
+* - Unlabeled fast path via sorted x-only index remains unchanged.
+* - Pre-decodes tx_outputs to Jacobian once; skips already matched outputs.
+* ========================================================================== */
 int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
@@ -585,10 +699,30 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_xonly_pubkey output_xonly;
     unsigned char shared_secret[33];
     const unsigned char *label_tweak = NULL;
-    size_t i, j, k, n_found, found_idx;
+    size_t i, j, k, n_found, found_idx, a2;
     int found, combined, valid_scan_key, ret;
 
-    /* Sanity check inputs */
+    /* Unlabeled fast-path index (PATCH A) */
+    secp256k1_sp_outidx* outidx = NULL;
+
+    /* Pre-decoded Jacobians & used flags (PATCH C) */
+    secp256k1_gej* tx_gej = NULL;
+    unsigned char* used_orig = NULL;
+
+    /* Batch buffers for label candidates */
+    secp256k1_gej cand_gej[64];
+    secp256k1_ge  cand_ge[64];
+    size_t idx_map[64];
+
+    /* Moving search heads (PATCH D) */
+    size_t head1 = 0, head2 = 0;      /* cursors for the two candidate families */
+    size_t n_unused;                  /* number of yet-unmatched outputs */
+
+    secp256k1_ge output_negated_ge;
+    unsigned char output_xonly32[32];
+    int pos0, pos;
+
+    /* -------- Sanity checks -------- */
     VERIFY_CHECK(ctx != NULL);
     ARG_CHECK(found_outputs != NULL);
     ARG_CHECK(n_found_outputs != NULL);
@@ -624,19 +758,55 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Clear the scan_key_scalar since we no longer need it and leaking this value would break indistinguishability of the transaction. */
     secp256k1_scalar_clear(&scan_key_scalar);
 
+    /* -------- Preprocessing: index + predecode -------- */
+
+    /* Sorted x-only index (unlabeled fast path) */
+    outidx = (secp256k1_sp_outidx*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*outidx));
+    for (j = 0; j < n_tx_outputs; j++) {
+        outidx[j].pk = tx_outputs[j];
+        outidx[j].orig_index = j;
+        outidx[j].used = 0;
+    }
+    secp256k1_hsort(outidx, n_tx_outputs, sizeof(*outidx), secp256k1_sp_outidx_cmp_xonly32, (void*)ctx);
+
+    /* Decode all outputs to Jacobian once for label fallback */
+    tx_gej = (secp256k1_gej*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*tx_gej));
+    used_orig = (unsigned char*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*used_orig));
+    memset(used_orig, 0, n_tx_outputs);
+    for (j = 0; j < n_tx_outputs; j++) {
+        secp256k1_ge ge;
+        secp256k1_xonly_pubkey_load(ctx, &ge, tx_outputs[j]);
+        secp256k1_gej_set_ge(&tx_gej[j], &ge);
+    }
+    n_unused = n_tx_outputs;
+
+    /* -------- Main scan loop -------- */
+
     found_idx = 0;
     n_found = 0;
     k = 0;
-    for (i = 0; i <= n_tx_outputs; i++) {
+
+    /* At most n_tx_outputs matches are possible */
+    for (i = 0; i < n_tx_outputs; i++) {
         secp256k1_ge output_ge = spend_pubkey_ge;
+
+        if (n_unused == 0) {
+            /* Nothing left to match */
+            break;
+        }
+
         /* Calculate the output_tweak and convert it to a scalar to ensure the value is less than the curve order.
          *
          * Note: _create_output_tweak can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
          * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
          */
-        if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
+        /* output = spend + H(shared_secret||k)*G */
+        if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, (uint32_t)k)) {
             secp256k1_scalar_clear(&output_tweak_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_gej);
+            free(used_orig);
+            free(outidx);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
             return 0;
         }
 
@@ -646,71 +816,168 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         if (!secp256k1_eckey_pubkey_tweak_add(&output_ge, &output_tweak_scalar)) {
             /* Leaking these values would break indistinguishability of the transaction, so clear them. */
             secp256k1_scalar_clear(&output_tweak_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_gej);
+            free(used_orig);
+            free(outidx);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
             return 0;
         }
-        found = 0;
+
+        /* Serialize x-only candidate once */
         secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_tx_outputs; j++) {
-            if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
-                label_tweak = NULL;
-                found = 1;
-                found_idx = j;
-                break;
+        ret = secp256k1_xonly_pubkey_serialize(ctx, output_xonly32, &output_xonly);
+#ifdef VERIFY
+        VERIFY_CHECK(ret);
+#else
+        (void)ret;
+#endif
+
+        /* ---- Unlabeled fast path: binary search in x-only index ---- */
+        found = 0;
+        label_tweak = NULL;
+        pos0 = secp256k1_sp_outidx_bsearch_first(ctx, outidx, n_tx_outputs, output_xonly32);
+        pos  = secp256k1_sp_outidx_find_unused_equal(ctx, outidx, n_tx_outputs, pos0, output_xonly32);
+        if (pos >= 0) {
+            size_t oj = outidx[pos].orig_index;
+            outidx[pos].used = 1;
+            if (!used_orig[oj]) { used_orig[oj] = 1; n_unused--; }
+            found = 1;
+            found_idx = (size_t)oj;
+            /* Advance both heads past the match (wrap once) */
+            head1 = head2 = (found_idx + 1u) % n_tx_outputs;
+        }
+
+        /* ---- Labeled fallback with moving heads ---- */
+        if (!found && label_lookup != NULL) {
+            size_t cnt, a;
+
+            /* Precompute -output_ge once per k */
+            secp256k1_ge_neg(&output_negated_ge, &output_ge);
+
+            /* -------- Candidate family #1: label = tx_output - output_ge -------- */
+            {
+                size_t scanned = 0;
+                size_t base = head1;
+                while (!found && scanned < n_tx_outputs) {
+                    cnt = 0;
+                    j = base;
+                    while (cnt < 64 && scanned < n_tx_outputs) {
+                        if (!used_orig[j]) {
+                            secp256k1_gej_add_ge_var(&cand_gej[cnt], &tx_gej[j], &output_negated_ge, NULL);
+                            idx_map[cnt] = j;
+                            cnt++;
+                        }
+                        j++; if (j == n_tx_outputs) j = 0;
+                        scanned++;
+                    }
+                    base = j;           /* continue from where we left off */
+                    head1 = base;       /* remember progress across k */
+
+                    if (cnt == 0) break; /* no unused left */
+                    secp256k1_ge_set_all_gej_var(cand_ge, cand_gej, cnt);
+                    for (a = 0; a < cnt; a++) {
+                        unsigned char label33[33];
+                        size_t len = 33;
+                        int ok = secp256k1_eckey_pubkey_serialize(&cand_ge[a], label33, &len, 1);
+#ifdef VERIFY
+                        VERIFY_CHECK(ok && len == 33);
+#else
+                        (void)ok;
+#endif
+                        label_tweak = label_lookup(label33, label_context);
+                        if (label_tweak != NULL) {
+                            found_idx = idx_map[a];
+                            if (!used_orig[found_idx]) { used_orig[found_idx] = 1; n_unused--; }
+                            found = 1;
+                            label_ge = cand_ge[a];
+
+                            /* Also mark used in the x-only index if present */
+                            {
+                                unsigned char ox[32];
+                                int p0, p1;
+                                int ser_ok = secp256k1_xonly_pubkey_serialize(ctx, ox, tx_outputs[found_idx]);
+#ifdef VERIFY
+                                VERIFY_CHECK(ser_ok);
+#else
+                                (void)ser_ok;
+#endif
+                                p0 = secp256k1_sp_outidx_bsearch_first(ctx, outidx, n_tx_outputs, ox);
+                                p1 = secp256k1_sp_outidx_find_unused_equal(ctx, outidx, n_tx_outputs, p0, ox);
+                                if (p1 >= 0) outidx[p1].used = 1;
+                            }
+
+                            /* Advance both heads past the match (wrap once) */
+                            head1 = head2 = (found_idx + 1u) % n_tx_outputs;
+                            break;
+                        }
+                    }
+                }
             }
 
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
-            if (label_lookup != NULL) {
-                secp256k1_ge output_negated_ge, tx_output_ge;
-                secp256k1_gej tx_output_gej, label_gej;
-                unsigned char label33[33];
-                size_t len;
+            /* -------- Candidate family #2: label2 = -tx_output - output_ge -------- */
+            if (!found) {
+                size_t scanned2 = 0;
+                size_t base2 = head2;
+                secp256k1_gej neg_tx;
+                while (!found && scanned2 < n_tx_outputs) {
+                    size_t cnt2 = 0;
+                    j = base2;
+                    while (cnt2 < 64 && scanned2 < n_tx_outputs) {
+                        if (!used_orig[j]) {
+                            secp256k1_gej_neg(&neg_tx, &tx_gej[j]);
+                            secp256k1_gej_add_ge_var(&cand_gej[cnt2], &neg_tx, &output_negated_ge, NULL);
+                            idx_map[cnt2] = j;
+                            cnt2++;
+                        }
+                        j++; if (j == n_tx_outputs) j = 0;
+                        scanned2++;
+                    }
+                    base2 = j;
+                    head2 = base2;
 
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
-                secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
-                secp256k1_ge_neg(&output_negated_ge, &output_ge);
-                secp256k1_gej_add_ge_var(&label_gej, &tx_output_gej, &output_negated_ge, NULL);
-                secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
-                /* Serialize must succeed because the point was just loaded.
-                 *
-                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
-                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
-                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
-                 * point at infinity.
-                 */
-                VERIFY_CHECK(ret && len == 33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
-                    found = 1;
-                    found_idx = j;
-                    break;
-                }
+                    if (cnt2 == 0) break;
+                    secp256k1_ge_set_all_gej_var(cand_ge, cand_gej, cnt2);
+                    for (a2 = 0; a2 < cnt2; a2++) {
+                        unsigned char label33b[33];
+                        size_t lenb = 33;
+                        int ok2 = secp256k1_eckey_pubkey_serialize(&cand_ge[a2], label33b, &lenb, 1);
+#ifdef VERIFY
+                        VERIFY_CHECK(ok2 && lenb == 33);
+#else
+                        (void)ok2;
+#endif
+                        label_tweak = label_lookup(label33b, label_context);
+                        if (label_tweak != NULL) {
+                            found_idx = idx_map[a2];
+                            if (!used_orig[found_idx]) { used_orig[found_idx] = 1; n_unused--; }
+                            found = 1;
+                            label_ge = cand_ge[a2];
 
-                secp256k1_gej_neg(&label_gej, &tx_output_gej);
-                /* If not found, negate the tx_output and calculate second scan label candidate:
-                 *     label2 = -tx_output - generated_output
-                 */
-                secp256k1_gej_add_ge_var(&label_gej, &label_gej, &output_negated_ge, NULL);
-                secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
-                /* Serialize must succeed because the point was just loaded.
-                 *
-                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
-                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
-                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
-                 * point at infinity.
-                 */
-                VERIFY_CHECK(ret && len == 33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
-                    found = 1;
-                    found_idx = j;
-                    break;
+                            /* Also mark used in the x-only index if present */
+                            {
+                                unsigned char ox2[32];
+                                int q0, q1;
+                                int ser_ok2 = secp256k1_xonly_pubkey_serialize(ctx, ox2, tx_outputs[found_idx]);
+#ifdef VERIFY
+                                VERIFY_CHECK(ser_ok2);
+#else
+                                (void)ser_ok2;
+#endif
+                                q0 = secp256k1_sp_outidx_bsearch_first(ctx, outidx, n_tx_outputs, ox2);
+                                q1 = secp256k1_sp_outidx_find_unused_equal(ctx, outidx, n_tx_outputs, q0, ox2);
+                                if (q1 >= 0) outidx[q1].used = 1;
+                            }
+
+                            head1 = head2 = (found_idx + 1u) % n_tx_outputs;
+                            break;
+                        }
+                    }
                 }
             }
         }
+
         if (found) {
+            /* Emit result */
             found_outputs[n_found]->output = *tx_outputs[found_idx];
             secp256k1_scalar_get_b32(found_outputs[n_found]->tweak, &output_tweak_scalar);
             /* Clear the output_tweak_scalar since we no longer need it and leaking this value would
@@ -736,8 +1003,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 /* Set the label public key with an invalid public key value. */
                 memset(&found_outputs[n_found]->label, 0, sizeof(secp256k1_pubkey));
             }
-            /* Reset everything for the next round of scanning. */
-            label_tweak = NULL;
+
+            /* Next k (bounded per BIP0352) */
             n_found++;
             /* BIP0352 specifies that k is serialized as a 4 byte (32 bit) value, so we check to make
              * sure we are not exceeding the max value for a uint32 before incrementing k.
@@ -747,19 +1014,30 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             if (k < UINT32_MAX) {
                 k++;
             } else {
+                free(tx_gej);
+                free(used_orig);
+                free(outidx);
+                secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
                 return 0;
             }
         } else {
+            /* No match for this k -> stop */
             secp256k1_scalar_clear(&output_tweak_scalar);
             break;
         }
     }
+
     *n_found_outputs = n_found;
 
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
+    /* Cleanup */
+    free(tx_gej);
+    free(used_orig);
+    free(outidx);
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     return 1;
 }
+
 
 int secp256k1_silentpayments_recipient_create_output_pubkeys(const secp256k1_context *ctx, secp256k1_xonly_pubkey **outputs_xonly, const unsigned char *scan_key32, const secp256k1_silentpayments_prevouts_summary *prevouts_summary, const secp256k1_pubkey **spend_pubkeys, size_t n_spend_pubkeys)
 {
