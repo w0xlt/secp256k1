@@ -213,10 +213,35 @@ silentpayments_example_SOURCES = examples/silentpayments.c
 silentpayments_example_CPPFLAGS = -I$(top_srcdir)/include -DSECP256K1_STATIC
 silentpayments_example_LDADD = libsecp256k1.la
 silentpayments_example_LDFLAGS = -static
+
+noinst_PROGRAMS += silentpayments_shuffle_labels_example
+silentpayments_shuffle_labels_example_SOURCES = examples/silentpayments_shuffle_labels.c
+silentpayments_shuffle_labels_example_CPPFLAGS = -I$(top_srcdir)/include -DSECP256K1_STATIC
+silentpayments_shuffle_labels_example_LDADD = libsecp256k1.la
+silentpayments_shuffle_labels_example_LDFLAGS = -static
+
+noinst_PROGRAMS += silentpayments_mixed_1_example
+silentpayments_mixed_1_example_SOURCES = examples/silentpayments_mixed_1.c
+silentpayments_mixed_1_example_CPPFLAGS = -I$(top_srcdir)/include -DSECP256K1_STATIC
+silentpayments_mixed_1_example_LDADD = libsecp256k1.la
+silentpayments_mixed_1_example_LDFLAGS = -static
+
+noinst_PROGRAMS += silentpayments_mixed_2_example
+silentpayments_mixed_2_example_SOURCES = examples/silentpayments_mixed_2.c
+silentpayments_mixed_2_example_CPPFLAGS = -I$(top_srcdir)/include -DSECP256K1_STATIC
+silentpayments_mixed_2_example_LDADD = libsecp256k1.la
+silentpayments_mixed_2_example_LDFLAGS = -static
+
 if BUILD_WINDOWS
 silentpayments_example_LDFLAGS += -lbcrypt
+silentpayments_shuffle_labels_example_LDFLAGS += -lbcrypt
+silentpayments_mixed_1_example_LDFLAGS += -lbcrypt
+silentpayments_mixed_2_example_LDFLAGS += -lbcrypt
 endif
 TESTS += silentpayments_example
+TESTS += silentpayments_shuffle_labels_example
+TESTS += silentpayments_mixed_1_example
+TESTS += silentpayments_mixed_2_example
 endif
 endif
 

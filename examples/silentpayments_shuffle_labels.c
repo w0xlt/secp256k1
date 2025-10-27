@@ -176,6 +176,53 @@ static const unsigned char* labels_index_lookup(const struct labels_cache *c, co
     return NULL;
 }
 
+
+/* --- Added: utilities to randomize label order and rebuild the index --- */
+
+/* Rebuild the O(1) index after any permutation of entries */
+static void labels_index_rebuild(struct labels_cache *c) {
+    size_t i;
+
+    if (c->index == NULL || c->index_cap == 0) return;
+    memset(c->index, 0, c->index_cap * sizeof(uint32_t));
+    for (i = 0; i < c->entries_used; i++) {
+        labels_index_insert(c, c->entries[i].label, i);
+    }
+}
+
+/* Simple, fast non-cryptographic 32-bit PRNG for shuffling.
+Seeded from a monotonic clock on first use. */
+static uint32_t rand32_fast(void) {
+    static uint64_t s = UINT64_C(0);
+    if (s == UINT64_C(0)) {
+        uint64_t t = (uint64_t)(now_seconds() * 1e9);
+        s = t ? t : UINT64_C(0x9e3779b97f4a7c15);
+    }
+    /* xorshift64* */
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    return (uint32_t)((s * UINT64_C(2685821657736338717)) >> 32);
+}
+
+/* Fisher–Yates shuffle of label cache entries (in-place). */
+static void shuffle_labels(struct labels_cache *c) {
+    size_t i,j;
+
+    if (c->entries_used <= 1) return;
+    for (i = c->entries_used - 1; i > 0; i--) {
+        j = (size_t)(rand32_fast() % (uint32_t)(i + 1));
+        if (j != i) {
+            struct label_cache_entry tmp = c->entries[i];
+            c->entries[i] = c->entries[j];
+            c->entries[j] = tmp;
+        }
+    }
+    /* Index points to entry indices, so we must rebuild it after shuffling. */
+    labels_index_rebuild(c);
+}
+/* --- End added utilities --- */
+
 const unsigned char* label_lookup(
     const unsigned char* label33,
     const void* cache_ptr
@@ -507,6 +554,9 @@ int main(void) {
 
         /*** Full scan with labels (Carol) ***/
         n_found_outputs = 0;
+/* Randomize the order of labels before scanning to test unordered-label performance */
+shuffle_labels(&carol_labels_cache);
+
         carol_full_t0 = now_seconds();
         {
             ret = secp256k1_silentpayments_recipient_scan_outputs(
