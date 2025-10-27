@@ -13,6 +13,9 @@ schnorr_example
 ellswift_example
 musig_example
 silentpayments_example
+silentpayments_shuffle_labels_example
+silentpayments_mixed_1
+silentpayments_mixed_2
 *.exe
 *.so
 *.a
