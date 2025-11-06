@@ -150,9 +150,22 @@ static void test_recipient_sort_helper(unsigned char (*sp_addresses[3])[2][33], 
         seckey_ptrs, 1
     );
     CHECK(ret == 1);
-    for (i = 0; i < 3; i++) {
-        secp256k1_xonly_pubkey_serialize(CTX, xonly_ser, &generated_outputs[i]);
-        CHECK(secp256k1_memcmp_var(xonly_ser, (*sp_outputs[i]), 32) == 0);
+    /* Do not rely on heapsort stability or specific tie-breaks; just ensure
+    * the set of outputs matches the expected set. */
+    {
+        int used[3] = {0,0,0};
+        size_t matched = 0, ii, jj;
+        for (ii = 0; ii < 3; ii++) {
+            secp256k1_xonly_pubkey_serialize(CTX, xonly_ser, &generated_outputs[ii]);
+            for (jj = 0; jj < 3; jj++) {
+                if (!used[jj] && secp256k1_memcmp_var(xonly_ser, (*sp_outputs[jj]), 32) == 0) {
+                    used[jj] = 1;
+                    matched++;
+                    break;
+                }
+            }
+        }
+        CHECK(matched == 3);
     }
 }
 
