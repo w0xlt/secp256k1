@@ -21,6 +21,19 @@
 /** magic bytes for ensuring prevouts_summary objects were initialized correctly. */
 static const unsigned char secp256k1_silentpayments_prevouts_summary_magic[4] = { 0xa7, 0x1c, 0xd3, 0x5e };
 
+/* Serialize a ge to compressed 33 bytes. Keeps eckey_pubkey_serialize usage uniform
+ * (expects non-const ge*), and centralizes the VERIFY_CHECK. */
+static SECP256K1_INLINE void secp256k1_sp_ge_serialize33(const secp256k1_ge* in, unsigned char out33[33]) {
+    size_t len = 33;
+    secp256k1_ge tmp = *in;
+    int ok = secp256k1_eckey_pubkey_serialize(&tmp, out33, &len, 1);
+#ifdef VERIFY
+    VERIFY_CHECK(ok && len == 33);
+#else
+    (void)ok;
+#endif
+}
+
 /** Sort an array of silent payment recipients. This is used to group recipients by scan pubkey to
  *  ensure the correct values of k are used when creating multiple outputs for a recipient.
  *
@@ -68,13 +81,11 @@ static int secp256k1_silentpayments_calculate_input_hash_scalar(secp256k1_scalar
     secp256k1_sha256 hash;
     unsigned char pubkey_sum_ser[33];
     unsigned char input_hash[32];
-    size_t len;
     int ret, overflow;
 
     secp256k1_silentpayments_sha256_init_inputs(&hash);
     secp256k1_sha256_write(&hash, outpoint_smallest36, 36);
-    ret = secp256k1_eckey_pubkey_serialize(pubkey_sum, pubkey_sum_ser, &len, 1);
-    VERIFY_CHECK(ret && len == sizeof(pubkey_sum_ser));
+    secp256k1_sp_ge_serialize33(pubkey_sum, pubkey_sum_ser);
     secp256k1_sha256_write(&hash, pubkey_sum_ser, sizeof(pubkey_sum_ser));
     secp256k1_sha256_finalize(&hash, input_hash);
     /* Convert input_hash to a scalar.
@@ -85,15 +96,13 @@ static int secp256k1_silentpayments_calculate_input_hash_scalar(secp256k1_scalar
      * an error to ensure strict compliance with BIP0352.
      */
     secp256k1_scalar_set_b32(input_hash_scalar, input_hash, &overflow);
-    ret &= !secp256k1_scalar_is_zero(input_hash_scalar);
+    ret = !secp256k1_scalar_is_zero(input_hash_scalar);
     return ret & !overflow;
 }
 
 static void secp256k1_silentpayments_create_shared_secret(const secp256k1_context *ctx, unsigned char *shared_secret33, const secp256k1_ge *public_component, const secp256k1_scalar *secret_component) {
     secp256k1_gej ss_j;
     secp256k1_ge ss;
-    size_t len;
-    int ret;
 
     secp256k1_ecmult_const(&ss_j, public_component, secret_component);
     secp256k1_ge_set_gej(&ss, &ss_j);
@@ -103,12 +112,7 @@ static void secp256k1_silentpayments_create_shared_secret(const secp256k1_contex
      * impossible at this point considering we have already validated the public key and
      * the secret key.
      */
-    ret = secp256k1_eckey_pubkey_serialize(&ss, shared_secret33, &len, 1);
-#ifdef VERIFY
-    VERIFY_CHECK(ret && len == 33);
-#else
-    (void)ret;
-#endif
+    secp256k1_sp_ge_serialize33(&ss, shared_secret33);
 
     /* Leaking these values would break indistinguishability of the transaction, so clear them. */
     secp256k1_ge_clear(&ss);
@@ -508,7 +512,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_xonly_pubkey output_xonly;
     unsigned char shared_secret[33];
     const unsigned char *label_tweak = NULL;
-    size_t j, k, found_idx;
+    size_t j, found_idx;
+    uint32_t k;
     int found, combined, valid_scan_key, ret;
 
     /* Sanity check inputs */
@@ -585,7 +590,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_ge output_negated_ge, tx_output_ge;
                 secp256k1_gej tx_output_gej, label_gej;
                 unsigned char label33[33];
-                size_t len;
 
                 secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
                 secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
@@ -595,7 +599,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_ge_neg(&output_negated_ge, &output_ge);
                 secp256k1_gej_add_ge_var(&label_gej, &tx_output_gej, &output_negated_ge, NULL);
                 secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
                 /* Serialize must succeed because the point was just loaded.
                  *
                  * Note: serialize will also fail if label_ge is the point at infinity, but we know
@@ -603,7 +606,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                  * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
                  * point at infinity.
                  */
-                VERIFY_CHECK(ret && len == 33);
+                secp256k1_sp_ge_serialize33(&label_ge, label33);
                 label_tweak = label_lookup(label33, label_context);
                 if (label_tweak != NULL) {
                     found = 1;
@@ -617,7 +620,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_gej_neg(&label_gej, &tx_output_gej);
                 secp256k1_gej_add_ge_var(&label_gej, &label_gej, &output_negated_ge, NULL);
                 secp256k1_ge_set_gej_var(&label_ge, &label_gej);
-                ret = secp256k1_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
                 /* Serialize must succeed because the point was just loaded.
                  *
                  * Note: serialize will also fail if label_ge is the point at infinity, but we know
@@ -625,7 +627,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                  * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
                  * point at infinity.
                  */
-                VERIFY_CHECK(ret && len == 33);
+                secp256k1_sp_ge_serialize33(&label_ge, label33);
                 label_tweak = label_lookup(label33, label_context);
                 if (label_tweak != NULL) {
                     found = 1;
