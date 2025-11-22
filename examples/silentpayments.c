@@ -112,15 +112,21 @@ const unsigned char* label_lookup(
     return NULL;
 }
 
+static secp256k1_xonly_pubkey tx_inputs[N_INPUTS];
+static const secp256k1_xonly_pubkey *tx_input_ptrs[N_INPUTS];
+static secp256k1_xonly_pubkey tx_outputs[N_OUTPUTS];
+static secp256k1_xonly_pubkey *tx_output_ptrs[N_OUTPUTS];
+static secp256k1_silentpayments_found_output found_outputs[N_OUTPUTS];
+static secp256k1_silentpayments_found_output *found_output_ptrs[N_OUTPUTS];
+static secp256k1_silentpayments_recipient recipients[N_OUTPUTS];
+static const secp256k1_silentpayments_recipient *recipient_ptrs[N_OUTPUTS];
+/* 2D array for holding multiple public key pairs. The second index, i.e., [2],
+ * is to represent the spend and scan public keys. */
+static unsigned char (*sp_addresses[N_OUTPUTS])[2][33];
+
 int main(void) {
     unsigned char randomize[32];
     unsigned char serialized_xonly[32];
-    secp256k1_xonly_pubkey tx_inputs[N_INPUTS];
-    const secp256k1_xonly_pubkey *tx_input_ptrs[N_INPUTS];
-    secp256k1_xonly_pubkey tx_outputs[N_OUTPUTS];
-    secp256k1_xonly_pubkey *tx_output_ptrs[N_OUTPUTS];
-    secp256k1_silentpayments_found_output found_outputs[N_OUTPUTS];
-    secp256k1_silentpayments_found_output *found_output_ptrs[N_OUTPUTS];
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
     secp256k1_pubkey unlabeled_spend_pubkey;
     struct labels_cache bob_labels_cache;
@@ -209,11 +215,6 @@ int main(void) {
     {
         secp256k1_keypair sender_keypairs[N_INPUTS];
         const secp256k1_keypair *sender_keypair_ptrs[N_INPUTS];
-        secp256k1_silentpayments_recipient recipients[N_OUTPUTS];
-        const secp256k1_silentpayments_recipient *recipient_ptrs[N_OUTPUTS];
-        /* 2D array for holding multiple public key pairs. The second index, i.e., [2],
-         * is to represent the spend and scan public keys. */
-        unsigned char (*sp_addresses[N_OUTPUTS])[2][33];
         unsigned char seckey[32];
 
         printf("Sending...\n");
@@ -358,7 +359,7 @@ int main(void) {
             n_found_outputs = 0;
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
-                (const secp256k1_xonly_pubkey * const *)tx_output_ptrs, N_OUTPUTS,
+                (const secp256k1_xonly_pubkey **)tx_output_ptrs, N_OUTPUTS,
                 bob_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
@@ -435,7 +436,7 @@ int main(void) {
             n_found_outputs = 0;
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
-                (const secp256k1_xonly_pubkey * const *)tx_output_ptrs, 1, /* dummy scan with one output (we only care about Bob) */
+                (const secp256k1_xonly_pubkey **)tx_output_ptrs, 1, /* dummy scan with one output (we only care about Bob) */
                 carol_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
