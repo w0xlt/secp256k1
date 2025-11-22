@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_silentpayments.h>
@@ -341,6 +342,9 @@ int main(void) {
              *        `secp256k1_silentpayments_recipient_prevouts_summary_create`
              *     2. Call `secp256k1_silentpayments_recipient_scan_outputs`
              */
+            clock_t start, end;
+            double cpu_time_used;
+
             ret = secp256k1_silentpayments_recipient_prevouts_summary_create(ctx,
                 &prevouts_summary,
                 smallest_outpoint,
@@ -357,6 +361,8 @@ int main(void) {
 
             /* Scan the transaction */
             n_found_outputs = 0;
+            
+            start = clock();
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
                 (const secp256k1_xonly_pubkey **)tx_output_ptrs, N_OUTPUTS,
@@ -365,6 +371,10 @@ int main(void) {
                 &unlabeled_spend_pubkey,
                 label_lookup, &bob_labels_cache /* NULL, NULL for no labels */
             );
+            end = clock();
+            cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
+            printf("Bob's scan took %f seconds\n", cpu_time_used);
+            
             if (!ret) {
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
                 return EXIT_SUCCESS;
