@@ -76,42 +76,24 @@ static unsigned char carol_address[2][33] = {
 
 /** Labels
  *
- *  The structs and callback function are implemented here as a demonstration
- *  of how the label lookup callback is meant to query a label cache and return
- *  the label tweak when a match is found. This is for demonstration purposes
- *  only and not optimized. In production, it is expected that the
- *  caller will be using a much more performant method for storing and querying
- *  labels.
+ *  Wallets that use labeled Silent Payments addresses are expected to keep
+ *  track of all labels they have created. For each label, the wallet should
+ *  store both the corresponding label public key and the 32-byte label tweak
+ *  returned by `secp256k1_silentpayments_recipient_create_label`.
+ *
+ *  A label entry bundles these two pieces of information. A label set is then
+ *  represented as a contiguous array of such entries.
  *
  *  Recipients not using labels can ignore these steps and simply pass `NULL`
- *  for the label_lookup and label_context arguments:
+ *  for the labels argument:
  *
- *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL, NULL);
+ *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL);
  */
-
-struct label_cache_entry {
-    unsigned char label[33];
-    unsigned char label_tweak[32];
-};
 
 struct labels_cache {
     size_t entries_used;
-    struct label_cache_entry entries[5];
+    secp256k1_silentpayments_label_entry entries[5];
 };
-
-const unsigned char* label_lookup(
-    const unsigned char* label33,
-    const void* cache_ptr
-) {
-    const struct labels_cache* cache = (const struct labels_cache*)cache_ptr;
-    size_t i;
-    for (i = 0; i < cache->entries_used; i++) {
-        if (memcmp(cache->entries[i].label, label33, 33) == 0) {
-            return cache->entries[i].label_tweak;
-        }
-    }
-    return NULL;
-}
 
 static secp256k1_xonly_pubkey tx_inputs[N_INPUTS];
 static const secp256k1_xonly_pubkey *tx_input_ptrs[N_INPUTS];
@@ -122,7 +104,7 @@ static secp256k1_silentpayments_found_output *found_output_ptrs[N_OUTPUTS];
 static secp256k1_silentpayments_recipient recipients[N_OUTPUTS];
 static const secp256k1_silentpayments_recipient *recipient_ptrs[N_OUTPUTS];
 /* 2D array for holding multiple public key pairs. The second index, i.e., [2],
- * is to represent the spend and scan public keys. */
+* is to represent the spend and scan public keys. */
 static unsigned char (*sp_addresses[N_OUTPUTS])[2][33];
 
 int main(void) {
@@ -131,6 +113,7 @@ int main(void) {
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
     secp256k1_pubkey unlabeled_spend_pubkey;
     struct labels_cache bob_labels_cache;
+    secp256k1_silentpayments_label_set bob_label_set;
     unsigned char bob_address[2][33];
     int ret;
     size_t i, n_found_outputs;
@@ -142,8 +125,8 @@ int main(void) {
         return EXIT_FAILURE;
     }
     /* Randomizing the context is recommended to protect against side-channel
-     * leakage. See `secp256k1_context_randomize` in secp256k1.h for more
-     * information about it. This should never fail. */
+    * leakage. See `secp256k1_context_randomize` in secp256k1.h for more
+    * information about it. This should never fail. */
     ret = secp256k1_context_randomize(ctx, randomize);
     assert(ret);
 
@@ -170,16 +153,16 @@ int main(void) {
         );
         assert(ret);
         /* Create a (label_tweak, label) pair and add them to the labels cache.
-         *
-         * Bob MUST keep track of all of the labels he has used by adding them
-         * to the labels cache. Otherwise, he will not find outputs sent to his
-         * labeled addresses when scanning. If Bob ever loses access to his cache
-         * or forgets the total number of labels used he can create a large cache
-         * with m = 0 ... 100_000, following the recommendation from BIP0352.
-         */
+        *
+        * Bob MUST keep track of all of the labels he has used by adding them
+        * to the labels cache. Otherwise, he will not find outputs sent to his
+        * labeled addresses when scanning. If Bob ever loses access to his cache
+        * or forgets the total number of labels used he can create a large cache
+        * with m = 0 ... 100_000, following the recommendation from BIP0352.
+        */
         ret = secp256k1_silentpayments_recipient_create_label(ctx,
             &label,
-            bob_labels_cache.entries[0].label_tweak,
+            bob_labels_cache.entries[0].label_tweak32,
             bob_scan_key,
             m
         );
@@ -187,17 +170,17 @@ int main(void) {
             printf("Something went wrong, event with negligible probability happened.\n");
             return EXIT_FAILURE;
         }
-        ret = secp256k1_ec_pubkey_serialize(ctx,
-            bob_labels_cache.entries[0].label,
-            &len,
-            &label,
-            SECP256K1_EC_COMPRESSED
-        );
-        assert(ret);
+        /* Store the label public key in the cache entry */
+        memcpy(&bob_labels_cache.entries[0].label, &label, sizeof(secp256k1_pubkey));
         bob_labels_cache.entries_used = 1;
+
+        /* Set up the label set to point to the cache entries */
+        bob_label_set.entries = bob_labels_cache.entries;
+        bob_label_set.n_entries = bob_labels_cache.entries_used;
+
         /* Now that the labels cache has been updated, Bob creates his labeled
-         * Silent Payments address and publishes it.
-         */
+        * Silent Payments address and publishes it.
+        */
         ret = secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(ctx, &labeled_spend_pubkey, &unlabeled_spend_pubkey, &label);
         if (!ret) {
             printf("Something went wrong, event with negligible probability happened.\n");
@@ -242,7 +225,7 @@ int main(void) {
                 return EXIT_FAILURE;
             }
             /* Try to create a keypair with a valid context, it should only fail
-             * if the secret key is zero or out of range. */
+            * if the secret key is zero or out of range. */
             if (secp256k1_keypair_create(ctx, &sender_keypairs[i], seckey)) {
                 sender_keypair_ptrs[i] = &sender_keypairs[i];
                 ret = secp256k1_keypair_xonly_pub(
@@ -260,13 +243,13 @@ int main(void) {
         /*** Create the recipient objects ***/
 
         /* Alice is sending to Bob and Carol in this transaction:
-         *
-         *     1. One output to Bob's labeled address
-         *     2. Two outputs for Carol
-         *
-         * To create multiple outputs for Carol, Alice simply passes Carol's
-         * Silent Payments address multiple times.
-         */
+        *
+        *     1. One output to Bob's labeled address
+        *     2. Two outputs for Carol
+        *
+        * To create multiple outputs for Carol, Alice simply passes Carol's
+        * Silent Payments address multiple times.
+        */
         sp_addresses[0] = &carol_address;
         sp_addresses[1] = &bob_address;
         sp_addresses[2] = &carol_address;
@@ -287,11 +270,11 @@ int main(void) {
             }
 
             /* Alice creates the recipient objects and adds the index of the
-             * original ordering (the ordering of the `sp_addresses` array) to
-             * each object. This index is used to return the generated outputs
-             * in the original ordering so that Alice can match up the generated
-             * outputs with the correct amounts.
-             */
+            * original ordering (the ordering of the `sp_addresses` array) to
+            * each object. This index is used to return the generated outputs
+            * in the original ordering so that Alice can match up the generated
+            * outputs with the correct amounts.
+            */
             recipients[i].index = i;
             recipient_ptrs[i] = &recipients[i];
         }
@@ -317,13 +300,13 @@ int main(void) {
             /* print_hex(serialized_xonly, sizeof(serialized_xonly)); */
         }
         /* It's best practice to try to clear secrets from memory after using
-         * them. This is done because some bugs can allow an attacker to leak
-         * memory, for example through "out of bounds" array access (see
-         * Heartbleed), or the OS swapping them to disk. Hence, we overwrite the
-         * secret key buffer with zeros.
-         *
-         * Here we are preventing these writes from being optimized out, as any
-         * good compiler will remove any writes that aren't used. */
+        * them. This is done because some bugs can allow an attacker to leak
+        * memory, for example through "out of bounds" array access (see
+        * Heartbleed), or the OS swapping them to disk. Hence, we overwrite the
+        * secret key buffer with zeros.
+        *
+        * Here we are preventing these writes from being optimized out, as any
+        * good compiler will remove any writes that aren't used. */
         secure_erase(seckey, sizeof(seckey));
         for (i = 0; i < N_INPUTS; i++) {
             secure_erase(&sender_keypairs[i], sizeof(sender_keypairs[i]));
@@ -353,8 +336,8 @@ int main(void) {
             );
             if (!ret) {
                 /* We need to always check that the prevouts data object is valid
-                 * before proceeding.
-                 */
+                * before proceeding.
+                */
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
                 return EXIT_SUCCESS;
             }
@@ -369,7 +352,7 @@ int main(void) {
                 bob_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
-                label_lookup, &bob_labels_cache /* NULL, NULL for no labels */
+                &bob_label_set /* NULL for no labels */
             );
             end = clock();
             cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
@@ -396,17 +379,17 @@ int main(void) {
                     /* print_hex(serialized_xonly, sizeof(serialized_xonly)); */
 
                     /* Verify that this output is spendable by Bob by reconstructing the full
-                     * secret key for the xonly output.
-                     *
-                     * This is done by adding the tweak from the transaction to Bob's spend key.
-                     * If the output was sent to a labeled address, the label tweak has already
-                     * been added to the tweak in `secp256k1_silentpayments_found_output`.
-                     *
-                     * To verify that we are able to sign for this output, it is sufficient to
-                     * check that the public key generated from `full_seckey` matches the output
-                     * in the transaction. For a full example on signing for a taproot ouput,
-                     * see `examples/schnorr.c`.
-                     */
+                    * secret key for the xonly output.
+                    *
+                    * This is done by adding the tweak from the transaction to Bob's spend key.
+                    * If the output was sent to a labeled address, the label tweak has already
+                    * been added to the tweak in `secp256k1_silentpayments_found_output`.
+                    *
+                    * To verify that we are able to sign for this output, it is sufficient to
+                    * check that the public key generated from `full_seckey` matches the output
+                    * in the transaction. For a full example on signing for a taproot ouput,
+                    * see `examples/schnorr.c`.
+                    */
                     memcpy(&full_seckey, &bob_spend_key, 32);
                     ret = secp256k1_ec_seckey_tweak_add(ctx, full_seckey, found_outputs[i].tweak);
                     ret &= secp256k1_keypair_create(ctx, &kp, full_seckey);
@@ -417,12 +400,12 @@ int main(void) {
                         &kp
                     );
                     /* We assert here because the only way the seckey_tweak_add operation can fail
-                     * is if the tweak is the negation of Bob's spend key.
-                     *
-                     * We also assert that the generated public key matches the transaction output,
-                     * as it should be impossible for a mismatch at this point considering the
-                     * scanning function completed without errors and indicated found outputs.
-                     */
+                    * is if the tweak is the negation of Bob's spend key.
+                    *
+                    * We also assert that the generated public key matches the transaction output,
+                    * as it should be impossible for a mismatch at this point considering the
+                    * scanning function completed without errors and indicated found outputs.
+                    */
                     assert(ret);
                     assert(secp256k1_xonly_pubkey_cmp(ctx, &xonly_output, &found_outputs[i].output) == 0);
                     secure_erase(full_seckey, sizeof(full_seckey));
@@ -450,7 +433,7 @@ int main(void) {
                 carol_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
-                NULL, NULL /* NULL, NULL for no labels */
+                NULL /* NULL for no labels */
             );
             if (!ret) {
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
@@ -458,8 +441,8 @@ int main(void) {
             }
             if (n_found_outputs > 0) {
                 /* Carol would spend these outputs the same as Bob, by tweaking her
-                 * spend key with the tweak corresponding to the found output. See above
-                 * for an example for Bob's outputs. */
+                * spend key with the tweak corresponding to the found output. See above
+                * for an example for Bob's outputs. */
                 printf("\n");
                 printf("Carol found the following outputs: \n");
                 for (i = 0; i < n_found_outputs; i++) {
