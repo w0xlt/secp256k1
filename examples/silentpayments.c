@@ -125,6 +125,29 @@ static const secp256k1_silentpayments_recipient *recipient_ptrs[N_OUTPUTS];
  * is to represent the spend and scan public keys. */
 static unsigned char (*sp_addresses[N_OUTPUTS])[2][33];
 
+/** Fisher-Yates shuffle for the tx_output_ptrs array
+ *
+ *  This function shuffles the output pointers to randomize their order
+ *  before scanning, allowing us to test scanning performance when outputs
+ *  are not in the order they were created.
+ */
+static void shuffle_outputs(size_t n) {
+    size_t i, j;
+    secp256k1_xonly_pubkey *temp;
+
+    /* Seed the random number generator */
+    srand((unsigned int)time(NULL));
+
+    /* Fisher-Yates shuffle algorithm */
+    for (i = n - 1; i > 0; i--) {
+        j = (size_t)(rand() % (i + 1));
+        /* Swap tx_output_ptrs[i] and tx_output_ptrs[j] */
+        temp = tx_output_ptrs[i];
+        tx_output_ptrs[i] = tx_output_ptrs[j];
+        tx_output_ptrs[j] = temp;
+    }
+}
+
 int main(void) {
     unsigned char randomize[32];
     unsigned char serialized_xonly[32];
@@ -333,6 +356,15 @@ int main(void) {
     /*** Receiving ***/
     {
         printf("Receiving...\n");
+
+        /*** Shuffle outputs before scanning ***
+         *
+         * Randomly shuffle the output pointers to test scanning performance
+         * when outputs are not in their original creation order.
+         */
+        printf("Shuffling outputs before scanning...\n");
+        shuffle_outputs(N_OUTPUTS);
+
         {
             /*** Scanning as a full node (Bob) ***
              *
@@ -373,7 +405,7 @@ int main(void) {
             );
             end = clock();
             cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-            printf("Bob's scan took %f seconds\n", cpu_time_used);
+            printf("Bob's scan took %f seconds (with shuffled outputs)\n", cpu_time_used);
 
             if (!ret) {
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
