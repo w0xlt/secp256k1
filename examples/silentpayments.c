@@ -83,9 +83,9 @@ static unsigned char carol_address[2][33] = {
  *  labels.
  *
  *  Recipients not using labels can ignore these steps and simply pass `NULL`
- *  for the label_lookup and label_context arguments:
+ *  for the `labels` argument:
  *
- *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL, NULL);
+ *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL);
  */
 
 struct label_cache_entry {
@@ -329,6 +329,8 @@ int main(void) {
     /*** Receiving ***/
     {
         {
+            secp256k1_silentpayments_labels labels;
+            
             /*** Scanning as a full node (Bob) ***
              *
              * Since Bob has access to the full transaction, scanning is simple:
@@ -353,13 +355,16 @@ int main(void) {
 
             /* Scan the transaction */
             n_found_outputs = 0;
+            labels.label_set = NULL;
+            labels.label_lookup = label_lookup;
+            labels.label_context = &bob_labels_cache;
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
                 (const secp256k1_xonly_pubkey**)tx_output_ptrs, N_OUTPUTS,
                 bob_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
-                label_lookup, &bob_labels_cache /* NULL, NULL for no labels */
+                &labels /* NULL for no labels */
             );
             if (!ret) {
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
@@ -436,7 +441,7 @@ int main(void) {
                 carol_scan_key,
                 &prevouts_summary,
                 &unlabeled_spend_pubkey,
-                NULL, NULL /* NULL, NULL for no labels */
+                NULL /* no labels */
             );
             if (!ret) {
                 printf("This transaction is not valid for Silent Payments, skipping.\n");
