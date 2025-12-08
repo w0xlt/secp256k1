@@ -189,7 +189,7 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
     if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_full_scan")) {
         {
             /* "BIP" scanning approach */
-            const size_t n_labels_bench[] = {0, 1};
+            const size_t n_labels_bench[] = {0, 1, 2, 3, 5, 10, 20, 50};
             const size_t n_outputs_bench[] = {2, 5, 10, 20, 50, 100, 200};
             size_t l, o;
             bench_silentpayments_scan_setup(&data);

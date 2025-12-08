@@ -703,6 +703,10 @@ static int secp256k1_silentpayments_tx_output_find(const secp256k1_context *ctx,
     return -1;
 }
 
+/* Define batch size for label processing. 32 is a safe stack allocation size 
+   (~5.5KB) that provides significant performance benefits. */
+#define SP_LABEL_BATCH_SIZE 32
+
 int secp256k1_silentpayments_recipient_scan_outputs2(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
@@ -801,48 +805,74 @@ int secp256k1_silentpayments_recipient_scan_outputs2(
             found_for_k = 1;
         }
 
-        /* If no unlabeled match, check labeled variants. */
+        /* If no unlabeled match, check labeled variants using batch normalization. */
         if (!found_for_k && labels != NULL) {
-            size_t li;
-            for (li = 0; li < labels->n_entries; ++li) {
-                secp256k1_gej out_j;
-                secp256k1_ge output_labeled_ge, label_ge;
-                ret = secp256k1_pubkey_load(ctx, &label_ge, &labels->entries[li].label);
-                if (!ret) {
-                    secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
-                    return 0;
+            size_t li_start;
+            /* Process labels in batches to utilize secp256k1_ge_set_all_gej_var (batch inversion) */
+            for (li_start = 0; li_start < labels->n_entries; li_start += SP_LABEL_BATCH_SIZE) {
+                secp256k1_gej gej_batch[SP_LABEL_BATCH_SIZE];
+                secp256k1_ge ge_batch[SP_LABEL_BATCH_SIZE];
+                size_t batch_len = labels->n_entries - li_start;
+                size_t i;
+
+                if (batch_len > SP_LABEL_BATCH_SIZE) {
+                    batch_len = SP_LABEL_BATCH_SIZE;
                 }
 
-                /* Q_label = Q_unlabeled + label_ge[li]. */
-                secp256k1_gej_set_ge(&out_j, &output_unlabeled_ge);
-                secp256k1_gej_add_ge_var(&out_j, &out_j, &label_ge, NULL);
-                if (secp256k1_gej_is_infinity(&out_j)) {
-                    /* This should be impossible for labels created via the API. */
-                    secp256k1_scalar_clear(&output_tweak_scalar);
-                    secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
-                    return 0;
-                }
-                secp256k1_ge_set_gej_var(&output_labeled_ge, &out_j);
-                secp256k1_xonly_pubkey_save(&output_xonly, &output_labeled_ge);
-                idx = secp256k1_silentpayments_tx_output_find(ctx, tx_outputs, n_tx_outputs, &output_xonly);
-                if (idx >= 0) {
-                    secp256k1_silentpayments_found_output *fo = found_outputs[found_count];
+                /* Step 1: Accumulate labeled candidates in Jacobian coordinates */
+                for (i = 0; i < batch_len; ++i) {
+                    size_t li = li_start + i;
+                    secp256k1_ge label_ge;
 
-                    fo->output = *tx_outputs[idx];
-                    secp256k1_scalar_get_b32(fo->tweak, &output_tweak_scalar);
-                    fo->found_with_label = 1;
-                    memcpy(&fo->label, &labels->entries[li].label, sizeof(secp256k1_pubkey));
-                    /* Add the label tweak to the output tweak.
-                     *
-                     * If this fails, it means label_tweak = -output_tweak (mod n); this is
-                     * treated as a non-fatal condition (the output is still spendable with
-                     * just the spend secret key), and we set tweak = 0.
-                     */
-                    if (!secp256k1_ec_seckey_tweak_add(ctx, fo->tweak, labels->entries[li].label_tweak32)) {
-                        memset(fo->tweak, 0, 32);
+                    ret = secp256k1_pubkey_load(ctx, &label_ge, &labels->entries[li].label);
+                    if (!ret) {
+                        secp256k1_scalar_clear(&output_tweak_scalar);
+                        secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+                        return 0;
                     }
-                    found_count++;
-                    found_for_k = 1;
+
+                    /* Q_label = Q_unlabeled + label_ge */
+                    secp256k1_gej_set_ge(&gej_batch[i], &output_unlabeled_ge);
+                    secp256k1_gej_add_ge_var(&gej_batch[i], &gej_batch[i], &label_ge, NULL);
+                }
+
+                /* Step 2: Batch normalize Jacobian points to Affine (1 inversion vs N) */
+                secp256k1_ge_set_all_gej_var(ge_batch, gej_batch, batch_len);
+
+                /* Step 3: Check candidates against transaction outputs */
+                for (i = 0; i < batch_len; ++i) {
+                    if (secp256k1_ge_is_infinity(&ge_batch[i])) {
+                        /* This should be impossible for labels created via the API. */
+                        secp256k1_scalar_clear(&output_tweak_scalar);
+                        secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+                        return 0;
+                    }
+
+                    secp256k1_xonly_pubkey_save(&output_xonly, &ge_batch[i]);
+                    idx = secp256k1_silentpayments_tx_output_find(ctx, tx_outputs, n_tx_outputs, &output_xonly);
+                    if (idx >= 0) {
+                        secp256k1_silentpayments_found_output *fo = found_outputs[found_count];
+                        size_t li = li_start + i;
+
+                        fo->output = *tx_outputs[idx];
+                        secp256k1_scalar_get_b32(fo->tweak, &output_tweak_scalar);
+                        fo->found_with_label = 1;
+                        memcpy(&fo->label, &labels->entries[li].label, sizeof(secp256k1_pubkey));
+                        /* Add the label tweak to the output tweak.
+                        *
+                        * If this fails, it means label_tweak = -output_tweak (mod n); this is
+                        * treated as a non-fatal condition (the output is still spendable with
+                        * just the spend secret key), and we set tweak = 0.
+                        */
+                        if (!secp256k1_ec_seckey_tweak_add(ctx, fo->tweak, labels->entries[li].label_tweak32)) {
+                            memset(fo->tweak, 0, 32);
+                        }
+                        found_count++;
+                        found_for_k = 1;
+                        break;
+                    }
+                }
+                if (found_for_k) {
                     break;
                 }
             }
@@ -864,5 +894,7 @@ int secp256k1_silentpayments_recipient_scan_outputs2(
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     return 1;
 }
+
+#undef SP_LABEL_BATCH_SIZE
 
 #endif
