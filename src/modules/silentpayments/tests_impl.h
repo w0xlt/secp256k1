@@ -368,6 +368,8 @@ static void test_recipient_api(void) {
     secp256k1_silentpayments_labels labels;
     secp256k1_silentpayments_labels labels_null_context;
     secp256k1_silentpayments_labels labels_no_labels;
+    secp256k1_silentpayments_label_entry label_entries[10];
+    secp256k1_silentpayments_label_set label_set;
 
     CHECK(secp256k1_ec_pubkey_parse(CTX, &p, BOB_ADDRESS[0], 33));
     memset(&malformed_p, 0, sizeof(malformed_p));
@@ -414,7 +416,9 @@ static void test_recipient_api(void) {
         CHECK(secp256k1_ec_pubkey_create(CTX, &neg_spend_pubkey, output_tweak));
         CHECK(secp256k1_ec_pubkey_negate(CTX, &neg_spend_pubkey));
 
-        labels.label_set = NULL;
+        label_set.entries = label_entries;
+        label_set.n_entries = 0;
+        labels.label_set = &label_set;
         labels.label_lookup = label_lookup;
         labels.label_context = &labels_cache;
         CHECK(secp256k1_silentpayments_recipient_scan_outputs(CTX,
@@ -449,7 +453,13 @@ static void test_recipient_api(void) {
         labels_cache.entries_used = 1;
         found = 0;
 
-        labels.label_set = NULL;
+        /* Mirror the labels cache in a label_set for the unified scan API. */
+        label_entries[0].label = neg_label_pubkey;
+        memcpy(label_entries[0].label_tweak32, output_tweak, 32);
+        label_set.entries = label_entries;
+        label_set.n_entries = 1;
+
+        labels.label_set = &label_set;
         labels.label_lookup = label_lookup;
         labels.label_context = &labels_cache;
         CHECK(secp256k1_silentpayments_recipient_scan_outputs(CTX,
@@ -466,11 +476,16 @@ static void test_recipient_api(void) {
     n_f = 0;
     labels_cache.entries_used = 0;
 
-    labels.label_set = NULL;
+    /* No labels in the cache for the following tests, but still provide an
+     * empty label_set so the unified scan API sees a consistent descriptor. */
+    label_set.entries = label_entries;
+    label_set.n_entries = labels_cache.entries_used;
+
+    labels.label_set = &label_set;
     labels.label_lookup = label_lookup;
     labels.label_context = &labels_cache;
 
-    labels_null_context.label_set = NULL;
+    labels_null_context.label_set = &label_set;
     labels_null_context.label_lookup = label_lookup;
     labels_null_context.label_context = NULL;
 
