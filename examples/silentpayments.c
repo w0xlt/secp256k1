@@ -124,6 +124,8 @@ int main(void) {
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
     secp256k1_pubkey unlabeled_spend_pubkey;
     struct labels_cache bob_labels_cache;
+    secp256k1_silentpayments_label_entry label_entries[5];
+    secp256k1_silentpayments_label_set label_set;
     unsigned char bob_address[2][33];
     int ret;
     size_t i, n_found_outputs;
@@ -188,6 +190,11 @@ int main(void) {
         );
         assert(ret);
         bob_labels_cache.entries_used = 1;
+        /* Mirror labels cache into a label_set for the unified scan API. */
+        label_entries[0].label = label;
+        memcpy(label_entries[0].label_tweak32, bob_labels_cache.entries[0].label_tweak, 32);
+        label_set.entries = label_entries;
+        label_set.n_entries = bob_labels_cache.entries_used;
         /* Now that the labels cache has been updated, Bob creates his labeled
          * Silent Payments address and publishes it.
          */
@@ -355,7 +362,7 @@ int main(void) {
 
             /* Scan the transaction */
             n_found_outputs = 0;
-            labels.label_set = NULL;
+            labels.label_set = &label_set;
             labels.label_lookup = label_lookup;
             labels.label_context = &bob_labels_cache;
             ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
