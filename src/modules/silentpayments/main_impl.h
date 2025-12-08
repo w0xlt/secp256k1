@@ -487,7 +487,7 @@ int secp256k1_silentpayments_recipient_prevouts_summary_create(
     return 1;
 }
 
-int secp256k1_silentpayments_recipient_scan_outputs(
+int secp256k1_silentpayments_recipient_bip_approach_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
     const secp256k1_xonly_pubkey **tx_outputs, size_t n_tx_outputs,
@@ -707,7 +707,7 @@ static int secp256k1_silentpayments_tx_output_find(const secp256k1_context *ctx,
    (~5.5KB) that provides significant performance benefits. */
 #define SP_LABEL_BATCH_SIZE 32
 
-int secp256k1_silentpayments_recipient_scan_outputs2(
+int secp256k1_silentpayments_recipient_label_set_approach_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
     const secp256k1_xonly_pubkey **tx_outputs, size_t n_tx_outputs,
@@ -893,6 +893,72 @@ int secp256k1_silentpayments_recipient_scan_outputs2(
      * transaction, so clear it. */
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     return 1;
+}
+
+/* ===================================================================== */
+/*  Unified recipient scanning wrapper                                   */
+/* ===================================================================== */
+
+int secp256k1_silentpayments_recipient_scan_outputs(
+    const secp256k1_context *ctx,
+    secp256k1_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
+    const secp256k1_xonly_pubkey **tx_outputs, size_t n_tx_outputs,
+    const unsigned char *scan_key32,
+    const secp256k1_silentpayments_prevouts_summary *prevouts_summary,
+    const secp256k1_pubkey *unlabeled_spend_pubkey,
+    const secp256k1_silentpayments_labels *labels
+) {
+    const secp256k1_silentpayments_label_set *label_set = NULL;
+    secp256k1_silentpayments_label_lookup label_lookup = NULL;
+    const void *label_context = NULL;
+    size_t n_labels = 0;
+
+    /* Sanity check inputs – mirror the algorithm-specific functions. */
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(found_outputs != NULL);
+    ARG_CHECK(n_found_outputs != NULL);
+    ARG_CHECK(tx_outputs != NULL);
+    ARG_CHECK(n_tx_outputs > 0);
+    ARG_CHECK(scan_key32 != NULL);
+    ARG_CHECK(prevouts_summary != NULL);
+    ARG_CHECK(unlabeled_spend_pubkey != NULL);
+
+    if (labels != NULL) {
+        label_set = labels->label_set;
+        label_lookup = labels->label_lookup;
+        if (label_lookup != NULL) {
+            /* Only pass a non-NULL context when a lookup callback is provided. */
+            label_context = labels->label_context;
+        }
+        if (label_set != NULL) {
+            n_labels = label_set->n_entries;
+        }
+    }
+
+    if (n_labels == 0 || (8 * n_tx_outputs < n_labels + 2)) {
+        /* Original BIP0352 scanning (callback-based) */
+        return secp256k1_silentpayments_recipient_bip_approach_scan_outputs(
+            ctx,
+            found_outputs, n_found_outputs,
+            tx_outputs, n_tx_outputs,
+            scan_key32,
+            prevouts_summary,
+            unlabeled_spend_pubkey,
+            label_lookup,
+            label_context
+        );
+    } else {
+        /* Label-set optimized scanning */
+        return secp256k1_silentpayments_recipient_label_set_approach_scan_outputs(
+            ctx,
+            found_outputs, n_found_outputs,
+            tx_outputs, n_tx_outputs,
+            scan_key32,
+            prevouts_summary,
+            unlabeled_spend_pubkey,
+            label_set
+        );
+    }
 }
 
 #undef SP_LABEL_BATCH_SIZE

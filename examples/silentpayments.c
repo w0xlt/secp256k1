@@ -85,7 +85,7 @@ static unsigned char carol_address[2][33] = {
  *  Recipients not using labels can ignore these steps and simply pass `NULL`
  *  for the label_lookup and label_context arguments:
  *
- *      secp256k1_silentpayments_recipient_scan_outputs(..., NULL, NULL);
+ *      secp256k1_silentpayments_recipient_bip_approach_scan_outputs(..., NULL, NULL);
  */
 
 struct label_cache_entry {
@@ -335,7 +335,7 @@ int main(void) {
              *
              *     1. Collect the relevant prevouts from the transaction and call
              *        `secp256k1_silentpayments_recipient_prevouts_summary_create`
-             *     2. Call `secp256k1_silentpayments_recipient_scan_outputs`
+             *     2. Call `secp256k1_silentpayments_recipient_bip_approach_scan_outputs`
              */
             ret = secp256k1_silentpayments_recipient_prevouts_summary_create(ctx,
                 &prevouts_summary,
@@ -353,7 +353,7 @@ int main(void) {
 
             /* Scan the transaction */
             n_found_outputs = 0;
-            ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
+            ret = secp256k1_silentpayments_recipient_bip_approach_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
                 (const secp256k1_xonly_pubkey**)tx_output_ptrs, N_OUTPUTS,
                 bob_scan_key,
@@ -430,7 +430,7 @@ int main(void) {
             assert(ret);
 
             n_found_outputs = 0;
-            ret = secp256k1_silentpayments_recipient_scan_outputs(ctx,
+            ret = secp256k1_silentpayments_recipient_bip_approach_scan_outputs(ctx,
                 found_output_ptrs, &n_found_outputs,
                 (const secp256k1_xonly_pubkey**)tx_output_ptrs, N_OUTPUTS,
                 carol_scan_key,

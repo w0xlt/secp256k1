@@ -125,7 +125,7 @@ static void bench_silentpayments_full_tx_scan(void* arg, int iters) {
             tx_input_ptrs, 2,
             NULL, 0
         ));
-        CHECK(secp256k1_silentpayments_recipient_scan_outputs(data->ctx,
+        CHECK(secp256k1_silentpayments_recipient_bip_approach_scan_outputs(data->ctx,
             found_output_ptrs, &n_found,
             tx_output_ptrs, data->n_outputs,
             data->scan_key,
@@ -168,7 +168,7 @@ static void bench_silentpayments_full_tx_scan2(void* arg, int iters) {
             tx_input_ptrs, 2,
             NULL, 0
         ));
-        CHECK(secp256k1_silentpayments_recipient_scan_outputs2(data->ctx,
+        CHECK(secp256k1_silentpayments_recipient_label_set_approach_scan_outputs(data->ctx,
             found_output_ptrs, &n_found,
             tx_output_ptrs, data->n_outputs,
             data->scan_key,
