@@ -108,52 +108,19 @@ static void bench_silentpayments_full_tx_scan(void* arg, int iters) {
     const secp256k1_xonly_pubkey *tx_input_ptrs[2];
     bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
-    const secp256k1_silentpayments_label_lookup label_lookup_fn = (data->n_labels > 0) ? label_lookup : NULL;
-    const void *label_context = (data->n_labels > 0) ? label_cache : NULL;
-
-    for (i = 0; i < 2; i++) {
-        tx_input_ptrs[i] = &data->tx_inputs[i];
-    }
-    for (i = 0; i < data->n_outputs; i++) {
-        found_output_ptrs[i] = &data->found_outputs[i];
-        tx_output_ptrs[i] = &data->tx_outputs[i];
-    }
-    for (i = 0; i < iters; i++) {
-        CHECK(secp256k1_silentpayments_recipient_prevouts_summary_create(data->ctx,
-            &prevouts_summary,
-            data->smallest_outpoint,
-            tx_input_ptrs, 2,
-            NULL, 0
-        ));
-        CHECK(secp256k1_silentpayments_recipient_bip_approach_scan_outputs(data->ctx,
-            found_output_ptrs, &n_found,
-            tx_output_ptrs, data->n_outputs,
-            data->scan_key,
-            &prevouts_summary,
-            &data->spend_pubkeys[0],
-            label_lookup_fn, label_context)
-        );
-        CHECK(n_found == 0);
-    }
-}
-
-/* TODO: deduplicate with above */
-static void bench_silentpayments_full_tx_scan2(void* arg, int iters) {
-    int i;
-    size_t n_found = 0;
-    secp256k1_silentpayments_found_output *found_output_ptrs[MAX_TX_OUTPUTS];
-    const secp256k1_xonly_pubkey *tx_output_ptrs[MAX_TX_OUTPUTS];
-    const secp256k1_xonly_pubkey *tx_input_ptrs[2];
-    bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
-    secp256k1_silentpayments_prevouts_summary prevouts_summary;
     secp256k1_silentpayments_label_set label_set;
-    secp256k1_silentpayments_label_set *label_set_ptr = NULL;
+    secp256k1_silentpayments_labels labels;
+    const secp256k1_silentpayments_labels *labels_ptr = NULL;
 
     if (data->n_labels > 0) {
         label_set.entries = &data->label_entries[0];
-        label_set.n_entries = data->n_labels;
-        label_set_ptr = &label_set;
+        label_set.n_entries = (size_t)data->n_labels;
+        labels.label_set = &label_set;
+        labels.label_lookup = label_lookup;
+        labels.label_context = label_cache;
+        labels_ptr = &labels;
     }
+
     for (i = 0; i < 2; i++) {
         tx_input_ptrs[i] = &data->tx_inputs[i];
     }
@@ -168,14 +135,14 @@ static void bench_silentpayments_full_tx_scan2(void* arg, int iters) {
             tx_input_ptrs, 2,
             NULL, 0
         ));
-        CHECK(secp256k1_silentpayments_recipient_label_set_approach_scan_outputs(data->ctx,
+        CHECK(secp256k1_silentpayments_recipient_scan_outputs(data->ctx,
             found_output_ptrs, &n_found,
             tx_output_ptrs, data->n_outputs,
             data->scan_key,
             &prevouts_summary,
             &data->spend_pubkeys[0],
-            label_set_ptr
-        ));
+            labels_ptr)
+        );
         CHECK(n_found == 0);
     }
 }
@@ -198,30 +165,10 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
                     const size_t n_labels = n_labels_bench[l];
                     const size_t n_outputs = n_outputs_bench[o];
                     char str[64];
-                    data.n_labels = n_labels;
-                    data.n_outputs = n_outputs;
-                    sprintf(str, "sp_full_scan_BIP-algo_L=%li_N=%li", n_labels, n_outputs);
+                    data.n_labels = (int)n_labels;
+                    data.n_outputs = (int)n_outputs;
+                    sprintf(str, "sp_full_scan_L=%li_N=%li", (long)n_labels, (long)n_outputs);
                     run_benchmark(str, bench_silentpayments_full_tx_scan, NULL, NULL, &data, 5, iters);
-                }
-                printf("-----\n");
-            }
-            printf("\n");
-        }
-        {
-            /* "Label set" scanning approach */
-            const size_t n_labels_bench[] = {0, 1, 2, 3, 5, 10, 20, 50};
-            const size_t n_outputs_bench[] = {2, 5, 10, 20, 50, 100, 200};
-            size_t l, o;
-            bench_silentpayments_scan_setup(&data);
-            for (l = 0; l < sizeof(n_labels_bench)/sizeof(n_labels_bench[0]); l++) {
-                for (o = 0; o < sizeof(n_outputs_bench)/sizeof(n_outputs_bench[0]); o++) {
-                    const size_t n_labels = n_labels_bench[l];
-                    const size_t n_outputs = n_outputs_bench[o];
-                    char str[64];
-                    data.n_labels = n_labels;
-                    data.n_outputs = n_outputs;
-                    sprintf(str, "sp_full_scan_LabelSet-algo_L=%li_N=%li", n_labels, n_outputs);
-                    run_benchmark(str, bench_silentpayments_full_tx_scan2, NULL, NULL, &data, 5, iters);
                 }
                 printf("-----\n");
             }
