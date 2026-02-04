@@ -702,7 +702,13 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             unsigned char labeled_output_xonly[32];
 
             /* calculate labeled_output = unlabeled_output + label */
-            secp256k1_silentpayments_label_load(ctx, &label_ge, &label_entries[li]->label);
+            if (!secp256k1_silentpayments_label_load(ctx, &label_ge, &label_entries[li]->label)) {
+                /* Leaking the shared_secret and output_tweak would break indistinguishability of the transaction, so
+                 * clear them before returning. */
+                secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+                secp256k1_scalar_clear(&output_tweak_scalar);
+                return 0;
+            }
             secp256k1_gej_set_ge(&labeled_output_gej, &unlabeled_output_ge);
             secp256k1_gej_add_ge_var(&labeled_output_gej, &labeled_output_gej, &label_ge, NULL);
             if (secp256k1_gej_is_infinity(&labeled_output_gej)) {
@@ -717,6 +723,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 memcpy(found_outputs[k]->output, labeled_output_xonly, 32);
                 secp256k1_scalar_get_b32(found_outputs[k]->tweak, &output_tweak_scalar);
                 found_outputs[k]->found_with_label = 1;
+                found_outputs[k]->label = label_entries[li]->label;
                 /* This is extremely unlikely to fail in that it can only really fail if label_tweak
                  * is the negation of the shared secret tweak. But since both tweak and label_tweak are
                  * created by hashing data, practically speaking this would only happen if an attacker
