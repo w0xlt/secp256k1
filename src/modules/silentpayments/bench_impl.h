@@ -244,6 +244,43 @@ static void bench_silentpayments_scan_match(void *arg, int iters) {
     bench_silentpayments_scan(arg, iters, 1);
 }
 
+static void bench_silentpayments_scan_bip(void* arg, int iters, int has_matches) {
+    bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
+    secp256k1_silentpayments_prevouts_summary prevouts_summary;
+    uint32_t n_found = 0;
+    const secp256k1_silentpayments_label_lookup label_lookup = data->num_labels > 0 ? bench_silentpayments_label_lookup : NULL;
+    const void *label_context = data->num_labels > 0 ? (const void*)data : NULL;
+    int i;
+
+    if (has_matches) {
+        CHECK(data->num_labels >= 1);
+    }
+    CHECK(data->num_labels <= SP_BENCH_MAX_LABELS);
+    CHECK(data->num_outputs <= SP_BENCH_MAX_OUTPUTS);
+
+    if (!has_matches) {
+        /* modify scan key to avoid matches */
+        data->scan_key[31] ^= 0x01;
+    }
+
+    for (i = 0; i < iters; i++) {
+        CHECK(secp256k1_silentpayments_recipient_prevouts_summary_create(data->ctx,
+            &prevouts_summary, data->smallest_outpoint, data->tx_inputs_ptrs, SP_BENCH_MAX_INPUTS, NULL, 0
+        ));
+        CHECK(secp256k1_silentpayments_recipient_scan_outputs_bip(data->ctx,
+            data->found_outputs_ptrs, &n_found,
+            (const secp256k1_xonly_pubkey * const*)data->tx_outputs_ptrs, (uint32_t)data->num_outputs,
+            data->scan_key, &prevouts_summary, &data->spend_pubkey,
+            label_lookup, label_context
+        ));
+        CHECK(n_found == (uint32_t)(has_matches ? data->num_outputs : 0));
+    }
+}
+
+static void bench_silentpayments_scan_bip_nomatch(void *arg, int iters) {
+    bench_silentpayments_scan_bip(arg, iters, 0);
+}
+
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
     const int num_labels_bench[] = {0, 1, 2, 5, 10, 20, 50, 100};
     const int num_outputs_bench[] = {10, 100, MAX_P2TR_OUTPUTS_PER_BLOCK/10};
@@ -261,8 +298,10 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
                 char str[64];
                 data.num_labels = num_labels;
                 data.num_outputs = num_outputs;
-                sprintf(str, "silentpayments_scan_nomatch_N=%i_L=%i", num_outputs, num_labels);
+                sprintf(str, "silentpayments_scan_nomatch_labelset_N=%i_L=%i", num_outputs, num_labels);
                 run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
+                sprintf(str, "silentpayments_scan_nomatch_bip_N=%i_L=%i", num_outputs, num_labels);
+                run_benchmark(str, bench_silentpayments_scan_bip_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
             }
             printf("\n");
         }
@@ -276,9 +315,11 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
             char str[64];
             data.num_labels = num_labels;
             data.num_outputs = MAX_P2TR_OUTPUTS_PER_BLOCK;
-            sprintf(str, "silentpayments_scan_worstcase_L=%i", num_labels);
+            sprintf(str, "silentpayments_scan_worstcase_labelset_L=%i", num_labels);
             run_benchmark(str, bench_silentpayments_scan_match, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
         }
+        /* BIP-style scanning with many matches can be quadratic in n_tx_outputs.
+         * To keep runtime reasonable, we only benchmark the common-case (no match) here. */
         printf("\n");
     }
 
