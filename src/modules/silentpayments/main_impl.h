@@ -596,6 +596,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 ) {
     secp256k1_scalar output_tweak_scalar, scan_key_scalar;
     secp256k1_ge unlabeled_spend_pubkey_ge, prevouts_pubkey_sum_ge;
+    secp256k1_ge label_ge_cache[SECP256K1_SILENTPAYMENTS_MAX_LABELS];
     unsigned char shared_secret[33];
     uint32_t k;
     size_t i, li;
@@ -621,6 +622,11 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         ARG_CHECK(n_label_entries <= SECP256K1_SILENTPAYMENTS_MAX_LABELS);
         for (i = 0; i < n_label_entries; i++) {
             ARG_CHECK(label_entries[i] != NULL);
+        }
+        for (i = 0; i < n_label_entries; i++) {
+            if (!secp256k1_silentpayments_label_load(ctx, &label_ge_cache[i], &label_entries[i]->label)) {
+                return 0;
+            }
         }
     } else {
         ARG_CHECK(n_label_entries == 0);
@@ -696,21 +702,13 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         /* Check for label matches by iterating through all passed entries and look
          * up each candidate in the list of tx outputs */
         for (li = 0; li < n_label_entries; li++) {
-            /* TODO: optimize label scanning loop by using batch inversion */
-            secp256k1_ge label_ge, labeled_output_ge;
+            secp256k1_ge labeled_output_ge;
             secp256k1_gej labeled_output_gej;
             unsigned char labeled_output_xonly[32];
 
             /* calculate labeled_output = unlabeled_output + label */
-            if (!secp256k1_silentpayments_label_load(ctx, &label_ge, &label_entries[li]->label)) {
-                /* Leaking the shared_secret and output_tweak would break indistinguishability of the transaction, so
-                 * clear them before returning. */
-                secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
-                secp256k1_scalar_clear(&output_tweak_scalar);
-                return 0;
-            }
             secp256k1_gej_set_ge(&labeled_output_gej, &unlabeled_output_ge);
-            secp256k1_gej_add_ge_var(&labeled_output_gej, &labeled_output_gej, &label_ge, NULL);
+            secp256k1_gej_add_ge_var(&labeled_output_gej, &labeled_output_gej, &label_ge_cache[li], NULL);
             if (secp256k1_gej_is_infinity(&labeled_output_gej)) {
                 /* "point at infinity" is not a valid x-only output candidate, so skip early */
                 continue;
