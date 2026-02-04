@@ -28,7 +28,10 @@ extern "C" {
  */
 
 /* Maximum number of Silent Payments recipients per group (i.e.
- * recipients sharing the same scan public key) as per BIP-352 */
+ * recipients sharing the same scan public key).
+ *
+ * Note that this is a protocol restriction that is still under discussion and
+ * may change in the future. */
 #define SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT 1000
 
 /** The data from a single recipient address
@@ -157,7 +160,7 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_silentpayments_recipien
 
 /** Serialize a Silent Payments label
  *
- *  Returns: 1 always
+ *  Returns: 1 when the label could be serialized, 0 otherwise.
  *  Args:    ctx: pointer to a context object
  *  Out:   out33: pointer to a 33-byte array to store the serialized label
  *  In:    label: pointer to the label
@@ -339,6 +342,11 @@ typedef struct secp256k1_silentpayments_found_output {
  *  Returns: 1 if output scanning was successful.
  *           0 if the transaction is not a Silent Payments transaction,
  *             or if the arguments are invalid.
+ *
+ *  Note:
+ *  Scanning is bounded by SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT and may
+ *  miss outputs if a transaction contains more outputs for a single scan public
+ *  key group than this limit.
  *
  *  Args:                   ctx: pointer to a context object
  *  Out:          found_outputs: pointer to an array of pointers to found

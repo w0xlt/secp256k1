@@ -736,8 +736,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_silentpayments_label_save(&found_outputs[k]->label, &label_ge);
             } else {
                 found_outputs[k]->found_with_label = 0;
-                /* Set the label public key with an invalid public key value. */
-                memset(&found_outputs[k]->label, 0, sizeof(secp256k1_pubkey));
+                /* Set the label to an invalid value. */
+                memset(&found_outputs[k]->label, 0, sizeof(found_outputs[k]->label));
             }
             /* Reset everything for the next round of scanning. */
             label_tweak = NULL;
