@@ -149,10 +149,12 @@ static void bench_silentpayments_scan(void* arg, int iters, int has_matches) {
     CHECK(data->num_outputs <= SP_BENCH_MAX_OUTPUTS);
 
     if (has_matches) {
-        /* to exhibit the worst-case, move label that would match (m=0) to the end of the label list */
-        secp256k1_silentpayments_label_entry match_label = data->label_entries[0];
-        data->label_entries[0] = data->label_entries[data->num_labels - 1];
-        data->label_entries[data->num_labels - 1] = match_label;
+        /* To exhibit the worst-case, move label that would match (m=0) to the end of the label list.
+         * We do this by swapping pointers (instead of swapping the label entries themselves), so other benchmark
+         * data that references label_entries (e.g. label caches) stays valid. */
+        const secp256k1_silentpayments_label_entry *match_label_ptr = data->label_entries_ptrs[0];
+        data->label_entries_ptrs[0] = data->label_entries_ptrs[data->num_labels - 1];
+        data->label_entries_ptrs[data->num_labels - 1] = match_label_ptr;
     } else {
         /* modify scan key to avoid matches */
         data->scan_key[31] ^= 0x01;
