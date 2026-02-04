@@ -311,7 +311,12 @@ typedef struct secp256k1_silentpayments_found_output {
     secp256k1_silentpayments_label label;
 } secp256k1_silentpayments_found_output;
 
-/** Hard limit on the number of labels that are allowed to be used for scanning. */
+/** Suggested limit on the number of labels that should be used for LabelSet-style scanning.
+ *
+ *  Using a large number of labels can significantly increase scanning time for pathological
+ *  transactions ("worst-case scanning attack"). Callers are encouraged to enforce a policy
+ *  limit appropriate for their application.
+ */
 #define SECP256K1_SILENTPAYMENTS_MAX_LABELS 500
 
 /** Scan for Silent Payments transaction outputs.
@@ -321,8 +326,8 @@ typedef struct secp256k1_silentpayments_found_output {
  *  noticable computational burden to the scanning process. Therefore, it is strongly
  *  discouraged to pass in more than 50 label entries. To avoid stalling the wallet
  *  for several minutes for pathological transactions ("worst-case scanning attack"),
- *  a hard limit is defined by SECP256K1_SILENTPAYMENTS_MAX_LABELS; values greater
- *  than that for the `n_label_entries` parameter are treated as illegal.
+ *  callers are strongly encouraged to enforce a policy limit (see
+ *  SECP256K1_SILENTPAYMENTS_MAX_LABELS).
  *
  *  A different way of scanning (the one recommended in the BIP), where the
  *  performance is independent of the number of labels, might be available in a
@@ -361,8 +366,8 @@ typedef struct secp256k1_silentpayments_found_output {
  *       unlabeled_spend_pubkey: pointer to the recipient's unlabeled spend public key
  *                label_entries: pointer to an array of label entries to scan for
  *                               (can be NULL if no labels scanning should be done)
- *              n_label_entries: number of passed label entries. Must not exceeed
- *                               SECP256K1_SILENTPAYMENTS_MAX_LABELS.
+ *              n_label_entries: number of passed label entries. Callers are encouraged
+ *                               to enforce a policy limit (e.g. SECP256K1_SILENTPAYMENTS_MAX_LABELS).
  */
 SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,

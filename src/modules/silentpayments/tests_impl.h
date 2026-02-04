@@ -524,7 +524,7 @@ static void test_recipient_api(void) {
     CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 1, ALICE_SECKEY, &ps, NULL, lep, 1));
     CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 0, ALICE_SECKEY, &ps, &p, lep, 1));
     CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 1, ALICE_SECKEY, &ps, &p, NULL, 1));
-    CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 1, ALICE_SECKEY, &ps, &p, lep, SECP256K1_SILENTPAYMENTS_MAX_LABELS + 1));
+    CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 1, ALICE_SECKEY, &ps, &p, lep, 0));
 
     /* Check that malformed secret key, public key, and prevouts_summary arguments are handled */
     CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &n_f, tp_ser, 1, ALICE_SECKEY, &ps, &malformed_p, NULL, 0));

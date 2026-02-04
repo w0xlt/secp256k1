@@ -596,7 +596,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 ) {
     secp256k1_scalar output_tweak_scalar, scan_key_scalar;
     secp256k1_ge unlabeled_spend_pubkey_ge, prevouts_pubkey_sum_ge;
-    secp256k1_ge label_ge_cache[SECP256K1_SILENTPAYMENTS_MAX_LABELS];
+    secp256k1_ge *label_ge_cache = NULL;
     unsigned char shared_secret[33];
     uint32_t k;
     size_t i, li;
@@ -622,12 +622,17 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     ARG_CHECK(unlabeled_spend_pubkey != NULL);
     if (label_entries != NULL) {
         ARG_CHECK(n_label_entries > 0);
-        ARG_CHECK(n_label_entries <= SECP256K1_SILENTPAYMENTS_MAX_LABELS);
         for (i = 0; i < n_label_entries; i++) {
             ARG_CHECK(label_entries[i] != NULL);
         }
+        ARG_CHECK(n_label_entries <= (SIZE_MAX / sizeof(*label_ge_cache)));
+        label_ge_cache = (secp256k1_ge*)checked_malloc(&ctx->error_callback, n_label_entries * sizeof(*label_ge_cache));
+        if (label_ge_cache == NULL) {
+            return 0;
+        }
         for (i = 0; i < n_label_entries; i++) {
             if (!secp256k1_silentpayments_label_load(ctx, &label_ge_cache[i], &label_entries[i]->label)) {
+                free(label_ge_cache);
                 return 0;
             }
         }
@@ -639,6 +644,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_declassify(ctx, &valid_scan_key, sizeof(valid_scan_key));
     if (!valid_scan_key) {
         secp256k1_scalar_clear(&scan_key_scalar);
+        free(label_ge_cache);
         return 0;
     }
     secp256k1_ge_from_bytes(&prevouts_pubkey_sum_ge, &prevouts_summary->data[5]);
@@ -651,6 +657,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     ret = secp256k1_pubkey_load(ctx, &unlabeled_spend_pubkey_ge, unlabeled_spend_pubkey);
     if (!ret) {
         secp256k1_scalar_clear(&scan_key_scalar);
+        free(label_ge_cache);
         return 0;
     }
     /* Creating the shared secret requires that the public and secret components are
@@ -679,6 +686,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(label_ge_cache);
             return 0;
         }
 
@@ -689,6 +697,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Leaking these values would break indistinguishability of the transaction, so clear them. */
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(label_ge_cache);
             return 0;
         }
         secp256k1_fe_normalize_var(&unlabeled_output_ge.x);
@@ -768,6 +777,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Leaking the shared_secret and output_tweak would break indistinguishability of the transaction, so clear them. */
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     secp256k1_scalar_clear(&output_tweak_scalar);
+    free(label_ge_cache);
     return 1;
 }
 
