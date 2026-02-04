@@ -602,6 +602,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     size_t i, li;
     int found_idx;
     int combined, valid_scan_key, ret;
+    enum { SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK = 64 };
+    secp256k1_gej labeled_output_candidates_gej[SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK];
+    secp256k1_ge labeled_output_candidates_ge[SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK];
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -701,40 +704,54 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
         /* Check for label matches by iterating through all passed entries and look
          * up each candidate in the list of tx outputs */
-        for (li = 0; li < n_label_entries; li++) {
-            secp256k1_ge labeled_output_ge;
-            secp256k1_gej labeled_output_gej;
+        for (li = 0; li < n_label_entries; li += SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK) {
+            size_t chunk_len = n_label_entries - li;
+            size_t ci;
             unsigned char labeled_output_xonly[32];
 
-            /* calculate labeled_output = unlabeled_output + label */
-            secp256k1_gej_set_ge(&labeled_output_gej, &unlabeled_output_ge);
-            secp256k1_gej_add_ge_var(&labeled_output_gej, &labeled_output_gej, &label_ge_cache[li], NULL);
-            if (secp256k1_gej_is_infinity(&labeled_output_gej)) {
-                /* "point at infinity" is not a valid x-only output candidate, so skip early */
-                continue;
+            if (chunk_len > SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK) {
+                chunk_len = SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK;
             }
-            secp256k1_ge_set_gej_var(&labeled_output_ge, &labeled_output_gej);
-            secp256k1_fe_normalize_var(&labeled_output_ge.x);
-            secp256k1_fe_get_b32(labeled_output_xonly, &labeled_output_ge.x);
-            found_idx = secp256k1_silentpayments_tx_output_find(tx_outputs, n_tx_outputs, labeled_output_xonly);
-            if (found_idx != -1) {
-                memcpy(found_outputs[k]->output, labeled_output_xonly, 32);
-                secp256k1_scalar_get_b32(found_outputs[k]->tweak, &output_tweak_scalar);
-                found_outputs[k]->found_with_label = 1;
-                found_outputs[k]->label = label_entries[li]->label;
-                /* This is extremely unlikely to fail in that it can only really fail if label_tweak
-                 * is the negation of the shared secret tweak. But since both tweak and label_tweak are
-                 * created by hashing data, practically speaking this would only happen if an attacker
-                 * tricked us into using a particular label_tweak (deviating from the protocol).
-                 *
-                 * Furthermore, although technically a failure for ec_seckey_tweak_add, this is not treated
-                 * as a failure for Silent Payments because the output is still spendable with just the
-                 * spend secret key. We set `tweak = 0` for this case.
-                 */
-                if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[k]->tweak, label_entries[li]->label_tweak)) {
-                    memset(found_outputs[k]->tweak, 0, 32);
+
+            /* Calculate labeled_output = unlabeled_output + label for the current chunk.
+             * We convert back to affine coordinates using batch inversion for performance. */
+            for (ci = 0; ci < chunk_len; ci++) {
+                secp256k1_gej_set_ge(&labeled_output_candidates_gej[ci], &unlabeled_output_ge);
+                secp256k1_gej_add_ge_var(&labeled_output_candidates_gej[ci], &labeled_output_candidates_gej[ci], &label_ge_cache[li + ci], NULL);
+            }
+            secp256k1_ge_set_all_gej_var(labeled_output_candidates_ge, labeled_output_candidates_gej, chunk_len);
+
+            for (ci = 0; ci < chunk_len; ci++) {
+                if (secp256k1_ge_is_infinity(&labeled_output_candidates_ge[ci])) {
+                    /* "point at infinity" is not a valid x-only output candidate, so skip early */
+                    continue;
                 }
-                labeled_match = 1;
+                secp256k1_fe_normalize_var(&labeled_output_candidates_ge[ci].x);
+                secp256k1_fe_get_b32(labeled_output_xonly, &labeled_output_candidates_ge[ci].x);
+                found_idx = secp256k1_silentpayments_tx_output_find(tx_outputs, n_tx_outputs, labeled_output_xonly);
+                if (found_idx != -1) {
+                    memcpy(found_outputs[k]->output, labeled_output_xonly, 32);
+                    secp256k1_scalar_get_b32(found_outputs[k]->tweak, &output_tweak_scalar);
+                    found_outputs[k]->found_with_label = 1;
+                    found_outputs[k]->label = label_entries[li + ci]->label;
+                    /* This is extremely unlikely to fail in that it can only really fail if label_tweak
+                     * is the negation of the shared secret tweak. But since both tweak and label_tweak are
+                     * created by hashing data, practically speaking this would only happen if an attacker
+                     * tricked us into using a particular label_tweak (deviating from the protocol).
+                     *
+                     * Furthermore, although technically a failure for ec_seckey_tweak_add, this is not treated
+                     * as a failure for Silent Payments because the output is still spendable with just the
+                     * spend secret key. We set `tweak = 0` for this case.
+                     */
+                    if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[k]->tweak, label_entries[li + ci]->label_tweak)) {
+                        memset(found_outputs[k]->tweak, 0, 32);
+                    }
+                    labeled_match = 1;
+                    break; /* leave chunk scanning loop */
+                }
+            }
+
+            if (labeled_match) {
                 break; /* leave label entries iteration loop */
             }
         }
