@@ -283,6 +283,16 @@ typedef struct secp256k1_silentpayments_label_entry {
     unsigned char label_tweak[32];
 } secp256k1_silentpayments_label_entry;
 
+/** Label lookup function for BIP-style scanning.
+ *
+ *  Takes a serialized 33-byte label public key and returns a pointer to the
+ *  corresponding 32-byte label tweak if the label exists, otherwise NULL.
+ *
+ *  Note: The returned pointer must remain valid until the next call to the
+ *  function or until the scanning function returns, whichever comes first.
+ */
+typedef const unsigned char* (*secp256k1_silentpayments_label_lookup)(const unsigned char* label33, const void* label_context);
+
 /** Found outputs struct
  *
  *  Struct for holding a found output along with data needed to spend it later.
