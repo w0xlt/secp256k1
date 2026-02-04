@@ -326,6 +326,14 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
             data.num_outputs = MAX_P2TR_OUTPUTS_PER_BLOCK;
             sprintf(str, "silentpayments_scan_worstcase_labelset_L=%i", num_labels);
             run_benchmark(str, bench_silentpayments_scan_match, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
+
+            /* Also measure the max-output common-case (no match) for both approaches.
+             * This is useful for "block-sized tx" performance comparisons without triggering
+             * approach-specific behavior (e.g., LabelSet worst-case label ordering). */
+            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_labelset_L=%i", num_labels);
+            run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
+            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_bip_L=%i", num_labels);
+            run_benchmark(str, bench_silentpayments_scan_bip_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
         }
         /* BIP-style scanning with many matches can be quadratic in n_tx_outputs.
          * To keep runtime reasonable, we only benchmark the common-case (no match) here. */
