@@ -371,8 +371,8 @@ static void bench_silentpayments_scan_bip_nomatch(void *arg, int iters) {
 }
 
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
-    const int num_labels_bench[] = {0, 1, 2, 5, 10, 20, 50, 100};
-    const int num_outputs_bench[] = {10, 100, MAX_P2TR_OUTPUTS_PER_BLOCK/10};
+    const int num_labels_bench[] = {100000}; /*{0, 1, 2, 5, 10, 20, 50, 100};*/
+    const int num_outputs_bench[] = {MAX_P2TR_OUTPUTS_PER_BLOCK}; /*{10, 100, MAX_P2TR_OUTPUTS_PER_BLOCK/10};*/
     bench_silentpayments_data data;
     int d = argc == 1;
 
