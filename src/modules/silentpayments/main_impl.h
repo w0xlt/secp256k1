@@ -314,6 +314,14 @@ int secp256k1_silentpayments_sender_create_outputs(
             secp256k1_silentpayments_create_shared_secret(ctx, shared_secret, &pk, &seckey_sum_scalar);
             k = 0;
         }
+        /* Enforce the per-group recipients protocol limit. This check must happen before
+         * generating the output for k, so we don't partially fill the outputs array with
+         * an out-of-protocol output on failure. */
+        if (k >= SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) {
+            secp256k1_scalar_clear(&seckey_sum_scalar);
+            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
         if (!secp256k1_silentpayments_create_output_pubkey(ctx, generated_outputs[recipients[i]->index], shared_secret, &recipients[i]->spend_pubkey, k)) {
             secp256k1_scalar_clear(&seckey_sum_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -321,11 +329,6 @@ int secp256k1_silentpayments_sender_create_outputs(
         }
         current_scan_pubkey = recipients[i]->scan_pubkey;
         k++;
-        /* Once the number of created outputs for the current recipient group exceeds the
-         * protocol limit, fail, as the recipient isn't guaranteed to find further ouputs. */
-        if (k > SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) {
-            return 0;
-        }
     }
     secp256k1_scalar_clear(&seckey_sum_scalar);
     secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
