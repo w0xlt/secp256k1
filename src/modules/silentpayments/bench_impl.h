@@ -387,10 +387,8 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
                 char str[64];
                 data.num_labels = num_labels;
                 data.num_outputs = num_outputs;
-                if (num_labels <= (int)SECP256K1_SILENTPAYMENTS_MAX_LABELS) {
-                    sprintf(str, "silentpayments_scan_nomatch_labelset_N=%i_L=%i", num_outputs, num_labels);
-                    run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
-                }
+                sprintf(str, "silentpayments_scan_nomatch_labelset_N=%i_L=%i", num_outputs, num_labels);
+                run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
                 sprintf(str, "silentpayments_scan_nomatch_bip_N=%i_L=%i", num_outputs, num_labels);
                 run_benchmark(str, bench_silentpayments_scan_bip_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
             }
