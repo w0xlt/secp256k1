@@ -151,7 +151,7 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_silentpayments_recipien
 
 /** Serialize a Silent Payments label
  *
- *  Returns: 1 always
+ *  Returns: 1 if the label could be serialized, 0 otherwise.
  *  Args:    ctx: pointer to a context object
  *  Out:   out33: pointer to a 33-byte array to store the serialized label
  *  In:    label: pointer to the label
@@ -322,6 +322,9 @@ typedef struct secp256k1_silentpayments_found_output {
  *  key, the list of label entries to scan for, and the relevant transaction outputs,
  *  scan for outputs belonging to the recipient and return the tweak(s) needed for
  *  spending the output(s).
+ *
+ *  Note: This function sorts the pointer array `tx_outputs` in-place (by output
+ *  bytes) to allow fast lookups via binary search.
  *
  *  For creating the label entries, `secp256k1_silentpayments_recipient_label_create`
  *  can be used.

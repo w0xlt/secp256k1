@@ -484,7 +484,18 @@ static void test_recipient_api(void) {
         found = 0;
         CHECK(secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &found, output_xonly_ser_ptrs, 1, ALICE_SECKEY, &ps, &spk, lep, 1));
         CHECK(found == 1);
+        CHECK(fp[0]->found_with_label == 1);
+        CHECK(secp256k1_memcmp_var(&fp[0]->label, &le[0].label, sizeof(fp[0]->label)) == 0);
         CHECK(secp256k1_memcmp_var(fp[0]->tweak, zero, 32) == 0);
+
+        /* Check that malformed labels are caught. */
+        {
+            secp256k1_silentpayments_label_entry bad_le = le[0];
+            const secp256k1_silentpayments_label_entry *bad_lep[1];
+            bad_lep[0] = &bad_le;
+            memset(&bad_le.label, 0, sizeof(bad_le.label));
+            CHECK_ILLEGAL(CTX, secp256k1_silentpayments_recipient_scan_outputs(CTX, fp, &found, output_xonly_ser_ptrs, 1, ALICE_SECKEY, &ps, &spk, bad_lep, 1));
+        }
     }
 
     n_f = 0;
