@@ -667,6 +667,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
     for (k = 0; k < n_tx_outputs; k++) {
         secp256k1_ge unlabeled_output_ge = unlabeled_spend_pubkey_ge;
+        secp256k1_gej unlabeled_output_gej;
         unsigned char unlabeled_output_xonly[32];
         int labeled_match = 0;
         /* Calculate the output_tweak and convert it to a scalar.
@@ -704,6 +705,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
         /* Check for label matches by iterating through all passed entries and look
          * up each candidate in the list of tx outputs */
+        secp256k1_gej_set_ge(&unlabeled_output_gej, &unlabeled_output_ge);
         for (li = 0; li < n_label_entries; li += SECP256K1_SILENTPAYMENTS_LABELSET_BATCH_CHUNK) {
             size_t chunk_len = n_label_entries - li;
             size_t ci;
@@ -716,8 +718,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Calculate labeled_output = unlabeled_output + label for the current chunk.
              * We convert back to affine coordinates using batch inversion for performance. */
             for (ci = 0; ci < chunk_len; ci++) {
-                secp256k1_gej_set_ge(&labeled_output_candidates_gej[ci], &unlabeled_output_ge);
-                secp256k1_gej_add_ge_var(&labeled_output_candidates_gej[ci], &labeled_output_candidates_gej[ci], &label_ge_cache[li + ci], NULL);
+                secp256k1_gej_add_ge_var(&labeled_output_candidates_gej[ci], &unlabeled_output_gej, &label_ge_cache[li + ci], NULL);
             }
             secp256k1_ge_set_all_gej_var(labeled_output_candidates_ge, labeled_output_candidates_gej, chunk_len);
 
