@@ -14,6 +14,16 @@
  *  tx fills up a full bock of taproot outputs that all go to the same scankey group) */
 #define MAX_P2TR_OUTPUTS_PER_BLOCK 23255
 
+/* Shuffle output ordering to avoid benchmarking only the "best-case" where outputs are in increasing k order.
+ * This affects BIP-style scanning and is useful for measuring expected performance when transaction outputs
+ * are arbitrarily ordered. */
+#ifndef SP_BENCH_SHUFFLE_TX_OUTPUTS
+#define SP_BENCH_SHUFFLE_TX_OUTPUTS 0
+#endif
+#ifndef SP_BENCH_SHUFFLE_SEED
+#define SP_BENCH_SHUFFLE_SEED 0x4f6c8d93a1b2c3d4ULL
+#endif
+
 #define SP_BENCH_MAX_INPUTS  1
 #define SP_BENCH_MAX_OUTPUTS MAX_P2TR_OUTPUTS_PER_BLOCK
 #define SP_BENCH_MAX_LABELS  1000000
@@ -56,6 +66,39 @@ static uint64_t bench_silentpayments_label33_hash(const unsigned char *label33) 
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+static uint64_t bench_silentpayments_splitmix64(uint64_t *state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static void bench_silentpayments_maybe_shuffle_tx_outputs(bench_silentpayments_data *data) {
+#if SP_BENCH_SHUFFLE_TX_OUTPUTS
+    uint64_t rng = SP_BENCH_SHUFFLE_SEED;
+    size_t i;
+
+    /* Fisher-Yates shuffle, swapping both pointer arrays in tandem so both scan implementations
+     * see the same transaction output order. */
+    for (i = (size_t)data->num_outputs; i > 1; i--) {
+        const size_t j = (size_t)(bench_silentpayments_splitmix64(&rng) % i);
+        const size_t a = i - 1;
+        secp256k1_xonly_pubkey *tmp_pk;
+        const unsigned char *tmp_ser;
+
+        tmp_pk = data->tx_outputs_ptrs[a];
+        data->tx_outputs_ptrs[a] = data->tx_outputs_ptrs[j];
+        data->tx_outputs_ptrs[j] = tmp_pk;
+
+        tmp_ser = data->tx_outputs_ser_ptrs_orig[a];
+        data->tx_outputs_ser_ptrs_orig[a] = data->tx_outputs_ser_ptrs_orig[j];
+        data->tx_outputs_ser_ptrs_orig[j] = tmp_ser;
+    }
+#else
+    (void)data;
+#endif
 }
 
 static void bench_silentpayments_label_cache_build(bench_silentpayments_data *data) {
@@ -246,6 +289,8 @@ static void bench_silentpayments_scan_setup(void* arg) {
             data->found_outputs_ptrs[i] = &data->found_outputs[i];
         }
 
+        bench_silentpayments_maybe_shuffle_tx_outputs(data);
+
         free(recipients_ptrs);
         free(recipients);
     }
@@ -375,6 +420,12 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
     const int num_outputs_bench[] = {MAX_P2TR_OUTPUTS_PER_BLOCK}; /*{10, 100, MAX_P2TR_OUTPUTS_PER_BLOCK/10};*/
     bench_silentpayments_data data;
     int d = argc == 1;
+    const char *order_tag =
+#if SP_BENCH_SHUFFLE_TX_OUTPUTS
+        "shuf";
+#else
+        "ord";
+#endif
 
     data.ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
 
@@ -384,12 +435,12 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
             for (l = 0; l < sizeof(num_labels_bench)/sizeof(num_labels_bench[0]); l++) {
                 const int num_labels = num_labels_bench[l];
                 const int num_outputs = num_outputs_bench[o];
-                char str[64];
+                char str[128];
                 data.num_labels = num_labels;
                 data.num_outputs = num_outputs;
-                sprintf(str, "silentpayments_scan_nomatch_labelset_N=%i_L=%i", num_outputs, num_labels);
+                sprintf(str, "silentpayments_scan_nomatch_labelset_%s_N=%i_L=%i", order_tag, num_outputs, num_labels);
                 run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
-                sprintf(str, "silentpayments_scan_nomatch_bip_N=%i_L=%i", num_outputs, num_labels);
+                sprintf(str, "silentpayments_scan_nomatch_bip_%s_N=%i_L=%i", order_tag, num_outputs, num_labels);
                 run_benchmark(str, bench_silentpayments_scan_bip_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, iters);
             }
             printf("\n");
@@ -401,18 +452,18 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
         size_t l;
         for (l = 0; l < sizeof(num_labels_bench_wc)/sizeof(num_labels_bench_wc[0]); l++) {
             const int num_labels = num_labels_bench_wc[l];
-            char str[64];
+            char str[128];
             data.num_labels = num_labels;
             data.num_outputs = MAX_P2TR_OUTPUTS_PER_BLOCK;
-            sprintf(str, "silentpayments_scan_worstcase_labelset_L=%i", num_labels);
+            sprintf(str, "silentpayments_scan_worstcase_labelset_%s_L=%i", order_tag, num_labels);
             run_benchmark(str, bench_silentpayments_scan_match, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
 
             /* Also measure the max-output common-case (no match) for both approaches.
              * This is useful for "block-sized tx" performance comparisons without triggering
              * approach-specific behavior (e.g., LabelSet worst-case label ordering). */
-            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_labelset_L=%i", num_labels);
+            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_labelset_%s_L=%i", order_tag, num_labels);
             run_benchmark(str, bench_silentpayments_scan_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
-            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_bip_L=%i", num_labels);
+            sprintf(str, "silentpayments_scan_maxoutputs_nomatch_bip_%s_L=%i", order_tag, num_labels);
             run_benchmark(str, bench_silentpayments_scan_bip_nomatch, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 10);
         }
         /* BIP-style scanning with many matches can be quadratic in n_tx_outputs.
