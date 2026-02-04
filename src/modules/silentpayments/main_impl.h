@@ -787,6 +787,12 @@ int secp256k1_silentpayments_recipient_scan_outputs_bip(
     uint32_t k;
     size_t i;
     int found, combined, valid_scan_key, ret;
+    enum { SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK = 64 };
+    secp256k1_ge tx_outputs_ge_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_gej tx_outputs_gej_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_gej label_candidates_gej_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_ge label_candidates_ge_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    unsigned char tx_outputs_xonly_ser_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK][32];
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -844,10 +850,6 @@ int secp256k1_silentpayments_recipient_scan_outputs_bip(
         unsigned char output_xonly_ser[32];
         unsigned char found_output_xonly_ser[32];
         unsigned char tx_output_xonly_ser[32];
-        secp256k1_ge tx_output_ge;
-        secp256k1_gej tx_output_gej;
-        secp256k1_gej label_candidates_gej[2];
-        secp256k1_ge label_candidates_ge[2];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -877,8 +879,8 @@ int secp256k1_silentpayments_recipient_scan_outputs_bip(
         secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        for (j = 0; j < n_tx_outputs; j++) {
-            if (label_lookup == NULL) {
+        if (label_lookup == NULL) {
+            for (j = 0; j < n_tx_outputs; j++) {
                 if (!secp256k1_xonly_pubkey_serialize(ctx, tx_output_xonly_ser, tx_outputs[j])) {
                     secp256k1_scalar_clear(&output_tweak_scalar);
                     secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -890,46 +892,75 @@ int secp256k1_silentpayments_recipient_scan_outputs_bip(
                     found = 1;
                     break;
                 }
-                continue;
             }
+        } else {
+            uint32_t j_start;
+            size_t chunk_len;
+            size_t ci;
 
-            if (!secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j])) {
-                secp256k1_scalar_clear(&output_tweak_scalar);
-                secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                return 0;
-            }
-            secp256k1_fe_normalize_var(&tx_output_ge.x);
-            secp256k1_fe_get_b32(tx_output_xonly_ser, &tx_output_ge.x);
-            if (secp256k1_memcmp_var(output_xonly_ser, tx_output_xonly_ser, sizeof(output_xonly_ser)) == 0) {
-                memcpy(found_output_xonly_ser, output_xonly_ser, sizeof(found_output_xonly_ser));
-                label_tweak = NULL;
-                found = 1;
-                break;
-            }
+            for (j_start = 0; j_start < n_tx_outputs; j_start += SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                chunk_len = n_tx_outputs - j_start;
+                if (chunk_len > SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                    chunk_len = SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK;
+                }
 
-            /* Calculate scan label candidates:
-             *     label_candidate1 =  tx_output - generated_output
-             *     label_candidate2 = -tx_output - generated_output */
-            secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
-            secp256k1_gej_add_ge_var(&label_candidates_gej[0], &tx_output_gej, &output_negated_ge, NULL);
-            secp256k1_gej_neg(&tx_output_gej, &tx_output_gej);
-            secp256k1_gej_add_ge_var(&label_candidates_gej[1], &tx_output_gej, &output_negated_ge, NULL);
-            secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2);
+                /* Load and preprocess outputs in this chunk. */
+                for (ci = 0; ci < chunk_len; ci++) {
+                    uint32_t j_idx = j_start + (uint32_t)ci;
+                    if (!secp256k1_xonly_pubkey_load(ctx, &tx_outputs_ge_batch[ci], tx_outputs[j_idx])) {
+                        secp256k1_scalar_clear(&output_tweak_scalar);
+                        secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                        return 0;
+                    }
+                    secp256k1_fe_normalize_var(&tx_outputs_ge_batch[ci].x);
+                    secp256k1_fe_get_b32(tx_outputs_xonly_ser_batch[ci], &tx_outputs_ge_batch[ci].x);
+                    if (secp256k1_memcmp_var(output_xonly_ser, tx_outputs_xonly_ser_batch[ci], sizeof(output_xonly_ser)) == 0) {
+                        memcpy(found_output_xonly_ser, output_xonly_ser, sizeof(found_output_xonly_ser));
+                        label_tweak = NULL;
+                        found = 1;
+                        break;
+                    }
 
-            /* Check if either of the label candidates is in the label cache */
-            for (i = 0; i < 2; i++) {
-                unsigned char label33[33];
-                secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[i], label33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
-                    memcpy(found_output_xonly_ser, tx_output_xonly_ser, sizeof(found_output_xonly_ser));
-                    found = 1;
-                    label_ge = label_candidates_ge[i];
+                    /* Calculate scan label candidates:
+                     *     label_candidate1 =  tx_output - generated_output
+                     *     label_candidate2 = -tx_output - generated_output */
+                    secp256k1_gej_set_ge(&tx_outputs_gej_batch[ci], &tx_outputs_ge_batch[ci]);
+                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci], &tx_outputs_gej_batch[ci], &output_negated_ge, NULL);
+                    secp256k1_gej_neg(&label_candidates_gej_batch[2 * ci + 1], &tx_outputs_gej_batch[ci]);
+                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci + 1], &label_candidates_gej_batch[2 * ci + 1], &output_negated_ge, NULL);
+                }
+
+                if (found) {
                     break;
                 }
-            }
-            if (found) {
-                break;
+
+                /* Convert candidates back to affine coordinates using batch inversion for performance. */
+                secp256k1_ge_set_all_gej_var(label_candidates_ge_batch, label_candidates_gej_batch, 2 * chunk_len);
+
+                /* Check if any candidate in this chunk is in the label cache. */
+                for (ci = 0; ci < chunk_len; ci++) {
+                    unsigned char label33[33];
+
+                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci], label33);
+                    label_tweak = label_lookup(label33, label_context);
+                    if (label_tweak != NULL) {
+                        memcpy(found_output_xonly_ser, tx_outputs_xonly_ser_batch[ci], sizeof(found_output_xonly_ser));
+                        found = 1;
+                        label_ge = label_candidates_ge_batch[2 * ci];
+                        break;
+                    }
+                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci + 1], label33);
+                    label_tweak = label_lookup(label33, label_context);
+                    if (label_tweak != NULL) {
+                        memcpy(found_output_xonly_ser, tx_outputs_xonly_ser_batch[ci], sizeof(found_output_xonly_ser));
+                        found = 1;
+                        label_ge = label_candidates_ge_batch[2 * ci + 1];
+                        break;
+                    }
+                }
+                if (found) {
+                    break;
+                }
             }
         }
         if (found) {
