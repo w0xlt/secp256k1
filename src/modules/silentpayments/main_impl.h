@@ -564,7 +564,7 @@ int secp256k1_silentpayments_recipient_prevouts_summary_create(
 int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, uint32_t *n_found_outputs,
-    const secp256k1_xonly_pubkey * const *tx_outputs, size_t n_tx_outputs,
+    const secp256k1_xonly_pubkey **tx_outputs, size_t n_tx_outputs,
     const unsigned char *scan_key32,
     const secp256k1_silentpayments_prevouts_summary *prevouts_summary,
     const secp256k1_pubkey *spend_pubkey,
@@ -577,6 +577,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     uint32_t k, k_max;
     size_t i, found_idx;
     int found, combined, valid_scan_key, ret;
+    size_t n_remaining_tx_outputs;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -627,6 +628,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
     /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
+    n_remaining_tx_outputs = n_tx_outputs;
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
         secp256k1_xonly_pubkey output_xonly;
@@ -662,7 +664,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
         found = 0;
         secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_tx_outputs; j++) {
+        for (j = 0; j < n_remaining_tx_outputs; j++) {
             if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
                 label_tweak = NULL;
                 found = 1;
@@ -736,6 +738,11 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 /* Set the label public key with an invalid public key value. */
                 memset(&found_outputs[k]->label, 0, sizeof(secp256k1_pubkey));
             }
+            /* Remove found entry from list of outputs to scan (shift remaining entries to the left) */
+            for (j = found_idx + 1; j < n_remaining_tx_outputs; j++) {
+                tx_outputs[j - 1] = tx_outputs[j];
+            }
+            n_remaining_tx_outputs--;
             /* Reset everything for the next round of scanning. */
             label_tweak = NULL;
         } else {
