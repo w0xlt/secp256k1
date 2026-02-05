@@ -634,12 +634,13 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     n_remaining_tx_outputs = n_tx_outputs;
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
-        secp256k1_xonly_pubkey output_xonly;
         secp256k1_ge output_ge = spend_pubkey_ge;
         secp256k1_ge output_negated_ge;
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
         size_t j;
+        unsigned char output_xonly_ser[32];
+        unsigned char tx_output_xonly_ser[32];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -662,27 +663,48 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             return 0;
         }
+        secp256k1_fe_normalize_var(&output_ge.x);
+        secp256k1_fe_get_b32(output_xonly_ser, &output_ge.x);
+
         /* Calculate output_negated = -output */
         secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_remaining_tx_outputs; j++) {
-            if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
-                label_tweak = NULL;
-                found = 1;
-                found_idx = j;
-                break;
+        if (label_lookup == NULL) {
+            for (j = 0; j < n_remaining_tx_outputs; j++) {
+                if (!secp256k1_xonly_pubkey_serialize(ctx, tx_output_xonly_ser, tx_outputs[j])) {
+                    secp256k1_scalar_clear(&output_tweak_scalar);
+                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                    return 0;
+                }
+                if (secp256k1_memcmp_var(output_xonly_ser, tx_output_xonly_ser, sizeof(output_xonly_ser)) == 0) {
+                    label_tweak = NULL;
+                    found = 1;
+                    found_idx = j;
+                    break;
+                }
             }
-
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
-            if (label_lookup != NULL) {
+        } else {
+            for (j = 0; j < n_remaining_tx_outputs; j++) {
                 secp256k1_ge tx_output_ge;
                 secp256k1_gej tx_output_gej;
                 secp256k1_gej label_candidates_gej[2];
                 secp256k1_ge label_candidates_ge[2];
 
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
+                if (!secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j])) {
+                    secp256k1_scalar_clear(&output_tweak_scalar);
+                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                    return 0;
+                }
+                secp256k1_fe_normalize_var(&tx_output_ge.x);
+                secp256k1_fe_get_b32(tx_output_xonly_ser, &tx_output_ge.x);
+                if (secp256k1_memcmp_var(output_xonly_ser, tx_output_xonly_ser, sizeof(output_xonly_ser)) == 0) {
+                    label_tweak = NULL;
+                    found = 1;
+                    found_idx = j;
+                    break;
+                }
+
                 secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
                 /* Calculate scan label candidates:
                  *     label_candidate1 =  tx_output - generated_output
