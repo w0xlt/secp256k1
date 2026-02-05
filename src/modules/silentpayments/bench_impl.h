@@ -43,6 +43,7 @@ typedef struct {
     unsigned char scan_key[32];
     secp256k1_xonly_pubkey *tx_outputs;
     secp256k1_xonly_pubkey **tx_outputs_ptrs;
+    secp256k1_xonly_pubkey **tx_outputs_ptrs_orig; /* original order of pointers to txs to scan */
     unsigned char *tx_outputs_ser;
     const unsigned char **tx_outputs_ser_ptrs_orig; /* original order of pointers to txs to scan */
     const unsigned char **tx_outputs_ser_ptrs;
@@ -274,6 +275,7 @@ static void bench_silentpayments_scan_setup(void* arg) {
 
         data->tx_outputs = malloc(sizeof(secp256k1_xonly_pubkey) * num_outputs);
         data->tx_outputs_ptrs = malloc(sizeof(secp256k1_xonly_pubkey*) * num_outputs);
+        data->tx_outputs_ptrs_orig = malloc(sizeof(secp256k1_xonly_pubkey*) * num_outputs);
         data->tx_outputs_ser = malloc(32 * num_outputs);
         data->tx_outputs_ser_ptrs_orig = malloc(sizeof(unsigned char*) * num_outputs);
         data->tx_outputs_ser_ptrs = malloc(sizeof(unsigned char*) * num_outputs);
@@ -298,6 +300,9 @@ static void bench_silentpayments_scan_setup(void* arg) {
         }
 
         bench_silentpayments_maybe_shuffle_tx_outputs(data);
+        for (i = 0; i < num_outputs; i++) {
+            data->tx_outputs_ptrs_orig[i] = data->tx_outputs_ptrs[i];
+        }
 
         free(recipients_ptrs);
         free(recipients);
@@ -310,6 +315,7 @@ static void bench_silentpayments_scan_teardown(void* arg, int iters) {
 
     free(data->tx_outputs);
     free(data->tx_outputs_ptrs);
+    free(data->tx_outputs_ptrs_orig);
     free(data->tx_outputs_ser);
     free(data->tx_outputs_ser_ptrs_orig);
     free(data->tx_outputs_ser_ptrs);
@@ -323,6 +329,7 @@ static void bench_silentpayments_scan_teardown(void* arg, int iters) {
 
     data->tx_outputs = NULL;
     data->tx_outputs_ptrs = NULL;
+    data->tx_outputs_ptrs_orig = NULL;
     data->tx_outputs_ser = NULL;
     data->tx_outputs_ser_ptrs_orig = NULL;
     data->tx_outputs_ser_ptrs = NULL;
@@ -392,7 +399,7 @@ static void bench_silentpayments_scan_bip(void* arg, int iters, int has_matches)
     uint32_t n_found = 0;
     const secp256k1_silentpayments_label_lookup label_lookup = data->num_labels > 0 ? bench_silentpayments_label_lookup : NULL;
     const void *label_context = data->num_labels > 0 ? (const void*)data : NULL;
-    int i;
+    int i, j;
 
     if (has_matches) {
         CHECK(data->num_labels >= 1);
@@ -409,9 +416,13 @@ static void bench_silentpayments_scan_bip(void* arg, int iters, int has_matches)
         CHECK(secp256k1_silentpayments_recipient_prevouts_summary_create(data->ctx,
             &prevouts_summary, data->smallest_outpoint, data->tx_inputs_ptrs, SP_BENCH_MAX_INPUTS, NULL, 0
         ));
+        /* restore original order of txs to scan (the scan function removes found outputs in place) */
+        for (j = 0; j < data->num_outputs; j++) {
+            data->tx_outputs_ptrs[j] = data->tx_outputs_ptrs_orig[j];
+        }
         CHECK(secp256k1_silentpayments_recipient_scan_outputs_bip(data->ctx,
             data->found_outputs_ptrs, &n_found,
-            (const secp256k1_xonly_pubkey * const*)data->tx_outputs_ptrs, (uint32_t)data->num_outputs,
+            (const secp256k1_xonly_pubkey **)data->tx_outputs_ptrs, (uint32_t)data->num_outputs,
             data->scan_key, &prevouts_summary, &data->spend_pubkey,
             label_lookup, label_context
         ));
