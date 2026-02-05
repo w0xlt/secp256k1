@@ -14,6 +14,14 @@
  *  tx fills up a full bock of taproot outputs that all go to the same scankey group) */
 #define MAX_P2TR_OUTPUTS_PER_BLOCK 23255
 
+/* Shuffle output ordering to avoid benchmarking only the "best-case" where outputs are in increasing k order. */
+#ifndef SP_BENCH_SHUFFLE_TX_OUTPUTS
+#define SP_BENCH_SHUFFLE_TX_OUTPUTS 0
+#endif
+#ifndef SP_BENCH_SHUFFLE_SEED
+#define SP_BENCH_SHUFFLE_SEED 0x4f6c8d93a1b2c3d4ULL
+#endif
+
 #define SP_BENCH_MAX_INPUTS  1
 #define SP_BENCH_MAX_OUTPUTS MAX_P2TR_OUTPUTS_PER_BLOCK
 
@@ -34,6 +42,33 @@ typedef struct {
     int num_outputs;
     int num_matches;
 } bench_silentpayments_data;
+
+static uint64_t bench_silentpayments_splitmix64(uint64_t *state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static void bench_silentpayments_maybe_shuffle_tx_outputs(bench_silentpayments_data *data) {
+#if SP_BENCH_SHUFFLE_TX_OUTPUTS
+    uint64_t rng = SP_BENCH_SHUFFLE_SEED;
+    size_t i;
+
+    /* Fisher-Yates shuffle. */
+    for (i = (size_t)data->num_outputs; i > 1; i--) {
+        const size_t j = (size_t)(bench_silentpayments_splitmix64(&rng) % i);
+        const size_t a = i - 1;
+        secp256k1_xonly_pubkey *tmp;
+
+        tmp = data->tx_outputs_ptrs[a];
+        data->tx_outputs_ptrs[a] = data->tx_outputs_ptrs[j];
+        data->tx_outputs_ptrs[j] = tmp;
+    }
+#else
+    (void)data;
+#endif
+}
 
 const unsigned char* label_lookup(const unsigned char* key, const void* cache_ptr) {
     bench_silentpayments_data *data = (bench_silentpayments_data*)cache_ptr;
@@ -139,6 +174,7 @@ static void bench_silentpayments_scan_setup(void* arg) {
             data->tx_outputs_ptrs[pos] = data->tx_outputs_ptrs[data->num_outputs - i - 1];
             data->tx_outputs_ptrs[data->num_outputs - i - 1] = tmp;
         }
+        bench_silentpayments_maybe_shuffle_tx_outputs(data);
         for (i = 0; i < data->num_outputs; i++) {
             data->tx_outputs_ptrs_orig[i] = data->tx_outputs_ptrs[i];
         }
@@ -189,6 +225,12 @@ static void bench_silentpayments_scan(void* arg, int iters) {
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
     bench_silentpayments_data data;
     int d = argc == 1;
+    const char *order_tag =
+#if SP_BENCH_SHUFFLE_TX_OUTPUTS
+        "shuf";
+#else
+        "ord";
+#endif
 
     data.ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
 
@@ -200,20 +242,26 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
             char str[64];
             data.num_outputs = num_outputs;
             data.num_matches = 0;
-            sprintf(str, "silentpayments_scan_nomatch_N=%i", num_outputs);
+            sprintf(str, "silentpayments_scan_nomatch_%s_N=%i", order_tag, num_outputs);
             run_benchmark(str, bench_silentpayments_scan, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, num_outputs < 100 ? iters : 1);
         }
     }
 
     if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_scan_worstcase")) {
         size_t k;
-        const int num_matches_bench[] = {10, 100, 1000};
+        const int num_matches_bench[] = {10, 100, 1000, MAX_P2TR_OUTPUTS_PER_BLOCK/10, MAX_P2TR_OUTPUTS_PER_BLOCK};
         for (k = 0; k < sizeof(num_matches_bench)/sizeof(num_matches_bench[0]); k++) {
-            const int num_matches = num_matches_bench[k];
+            const int num_matches_req = num_matches_bench[k];
+            const int num_matches = (num_matches_req > SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
+                SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT : num_matches_req;
             char str[64];
             data.num_outputs = MAX_P2TR_OUTPUTS_PER_BLOCK;
             data.num_matches = num_matches;
-            sprintf(str, "silentpayments_scan_worstcase_K=%i", num_matches);
+            if (num_matches_req != num_matches) {
+                sprintf(str, "silentpayments_scan_worstcase_%s_K=%i_cap=%i", order_tag, num_matches_req, num_matches);
+            } else {
+                sprintf(str, "silentpayments_scan_worstcase_%s_K=%i", order_tag, num_matches);
+            }
             run_benchmark(str, bench_silentpayments_scan, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 3, 1);
         }
     }
