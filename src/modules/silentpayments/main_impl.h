@@ -314,6 +314,14 @@ int secp256k1_silentpayments_sender_create_outputs(
             secp256k1_silentpayments_create_shared_secret(ctx, shared_secret, &pk, &seckey_sum_scalar);
             k = 0;
         }
+        /* Enforce the per-group recipients protocol limit. This check must happen before
+         * generating the output for k, so we don't partially fill the outputs array with
+         * an out-of-protocol output on failure. */
+        if (k >= SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) {
+            secp256k1_scalar_clear(&seckey_sum_scalar);
+            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
         if (!secp256k1_silentpayments_create_output_pubkey(ctx, generated_outputs[recipients[i]->index], shared_secret, &recipients[i]->spend_pubkey, k)) {
             secp256k1_scalar_clear(&seckey_sum_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -321,11 +329,6 @@ int secp256k1_silentpayments_sender_create_outputs(
         }
         current_scan_pubkey = recipients[i]->scan_pubkey;
         k++;
-        /* Once the number of created outputs for the current recipient group exceeds the
-         * protocol limit, fail, as the recipient isn't guaranteed to find further ouputs. */
-        if (k > SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) {
-            return 0;
-        }
     }
     secp256k1_scalar_clear(&seckey_sum_scalar);
     secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -577,6 +580,12 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     uint32_t k, k_max;
     size_t i, found_idx;
     int found, combined, valid_scan_key, ret;
+    enum { SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK = 64 };
+    secp256k1_ge tx_outputs_ge_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_gej tx_outputs_gej_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_gej label_candidates_gej_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    secp256k1_ge label_candidates_ge_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+    unsigned char tx_outputs_xonly_ser_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK][32];
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -629,12 +638,13 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
-        secp256k1_xonly_pubkey output_xonly;
         secp256k1_ge output_ge = spend_pubkey_ge;
         secp256k1_ge output_negated_ge;
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
         size_t j;
+        unsigned char output_xonly_ser[32];
+        unsigned char tx_output_xonly_ser[32];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -657,51 +667,90 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             return 0;
         }
+        secp256k1_fe_normalize_var(&output_ge.x);
+        secp256k1_fe_get_b32(output_xonly_ser, &output_ge.x);
+
         /* Calculate output_negated = -output */
         secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_tx_outputs; j++) {
-            if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
-                label_tweak = NULL;
-                found = 1;
-                found_idx = j;
-                break;
+        if (label_lookup == NULL) {
+            for (j = 0; j < n_tx_outputs; j++) {
+                if (!secp256k1_xonly_pubkey_serialize(ctx, tx_output_xonly_ser, tx_outputs[j])) {
+                    secp256k1_scalar_clear(&output_tweak_scalar);
+                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                    return 0;
+                }
+                if (secp256k1_memcmp_var(output_xonly_ser, tx_output_xonly_ser, sizeof(output_xonly_ser)) == 0) {
+                    label_tweak = NULL;
+                    found = 1;
+                    found_idx = j;
+                    break;
+                }
             }
+        } else {
+            size_t j_start;
+            size_t chunk_len;
+            size_t ci;
 
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
-            if (label_lookup != NULL) {
-                secp256k1_ge tx_output_ge;
-                secp256k1_gej tx_output_gej;
-                secp256k1_gej label_candidates_gej[2];
-                secp256k1_ge label_candidates_ge[2];
+            for (j_start = 0; j_start < n_tx_outputs; j_start += SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                chunk_len = n_tx_outputs - j_start;
+                if (chunk_len > SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                    chunk_len = SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK;
+                }
 
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
-                secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
-                /* Calculate scan label candidates:
-                 *     label_candidate1 =  tx_output - generated_output
-                 *     label_candidate2 = -tx_output - generated_output
-                 */
-                secp256k1_gej_add_ge_var(&label_candidates_gej[0], &tx_output_gej, &output_negated_ge, NULL);
-                secp256k1_gej_neg(&tx_output_gej, &tx_output_gej);
-                secp256k1_gej_add_ge_var(&label_candidates_gej[1], &tx_output_gej, &output_negated_ge, NULL);
-                secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2);
+                /* Load and preprocess outputs in this chunk. */
+                for (ci = 0; ci < chunk_len; ci++) {
+                    size_t j_idx = j_start + ci;
 
-                /* Check if either of the label candidates is in the label cache */
-                for (i = 0; i < 2; i++) {
+                    if (!secp256k1_xonly_pubkey_load(ctx, &tx_outputs_ge_batch[ci], tx_outputs[j_idx])) {
+                        secp256k1_scalar_clear(&output_tweak_scalar);
+                        secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                        return 0;
+                    }
+                    secp256k1_fe_normalize_var(&tx_outputs_ge_batch[ci].x);
+                    secp256k1_fe_get_b32(tx_outputs_xonly_ser_batch[ci], &tx_outputs_ge_batch[ci].x);
+                    if (secp256k1_memcmp_var(output_xonly_ser, tx_outputs_xonly_ser_batch[ci], sizeof(output_xonly_ser)) == 0) {
+                        label_tweak = NULL;
+                        found = 1;
+                        found_idx = j_idx;
+                        break;
+                    }
+
+                    /* Calculate scan label candidates:
+                     *     label_candidate1 =  tx_output - generated_output
+                     *     label_candidate2 = -tx_output - generated_output */
+                    secp256k1_gej_set_ge(&tx_outputs_gej_batch[ci], &tx_outputs_ge_batch[ci]);
+                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci], &tx_outputs_gej_batch[ci], &output_negated_ge, NULL);
+                    secp256k1_gej_neg(&label_candidates_gej_batch[2 * ci + 1], &tx_outputs_gej_batch[ci]);
+                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci + 1], &label_candidates_gej_batch[2 * ci + 1], &output_negated_ge, NULL);
+                }
+
+                if (found) {
+                    break;
+                }
+
+                /* Convert candidates back to affine coordinates using batch inversion for performance. */
+                secp256k1_ge_set_all_gej_var(label_candidates_ge_batch, label_candidates_gej_batch, 2 * chunk_len);
+
+                /* Check if any candidate in this chunk is in the label cache. */
+                for (ci = 0; ci < chunk_len; ci++) {
                     unsigned char label33[33];
-                    /* Note: serialize will only fail if label_ge is the point at infinity, but we know
-                     * this cannot happen since we only hit this branch if tx_output != output_xonly.
-                     * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
-                     * point at infinity.
-                     */
-                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[i], label33);
+
+                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci], label33);
                     label_tweak = label_lookup(label33, label_context);
                     if (label_tweak != NULL) {
                         found = 1;
-                        found_idx = j;
-                        label_ge = label_candidates_ge[i];
+                        found_idx = j_start + ci;
+                        label_ge = label_candidates_ge_batch[2 * ci];
+                        break;
+                    }
+                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci + 1], label33);
+                    label_tweak = label_lookup(label33, label_context);
+                    if (label_tweak != NULL) {
+                        found = 1;
+                        found_idx = j_start + ci;
+                        label_ge = label_candidates_ge_batch[2 * ci + 1];
                         break;
                     }
                 }
@@ -733,8 +782,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_silentpayments_label_save(&found_outputs[k]->label, &label_ge);
             } else {
                 found_outputs[k]->found_with_label = 0;
-                /* Set the label public key with an invalid public key value. */
-                memset(&found_outputs[k]->label, 0, sizeof(secp256k1_pubkey));
+                /* Set the label to an invalid value. */
+                memset(&found_outputs[k]->label, 0, sizeof(found_outputs[k]->label));
             }
             /* Reset everything for the next round of scanning. */
             label_tweak = NULL;
