@@ -24,6 +24,14 @@
 #define SP_BENCH_SHUFFLE_SEED 0x4f6c8d93a1b2c3d4ULL
 #endif
 
+/* Run BIP-style scanning in the "all outputs match" scenario (i.e., scan finds N outputs).
+ *
+ * IMPORTANT: This can be quadratic in N, and with shuffled outputs it can take minutes for
+ * N=23255. Keep disabled unless you intentionally want to exercise the worst case. */
+#ifndef SP_BENCH_BIP_BENCH_MATCH
+#define SP_BENCH_BIP_BENCH_MATCH 0
+#endif
+
 #define SP_BENCH_MAX_INPUTS  1
 #define SP_BENCH_MAX_OUTPUTS MAX_P2TR_OUTPUTS_PER_BLOCK
 #define SP_BENCH_MAX_LABELS  1000000
@@ -415,6 +423,10 @@ static void bench_silentpayments_scan_bip_nomatch(void *arg, int iters) {
     bench_silentpayments_scan_bip(arg, iters, 0);
 }
 
+static void bench_silentpayments_scan_bip_match(void *arg, int iters) {
+    bench_silentpayments_scan_bip(arg, iters, 1);
+}
+
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
     const int num_labels_bench[] = {100000}; /*{0, 1, 2, 5, 10, 20, 50, 100};*/
     const int num_outputs_bench[] = {MAX_P2TR_OUTPUTS_PER_BLOCK}; /*{10, 100, MAX_P2TR_OUTPUTS_PER_BLOCK/10};*/
@@ -468,6 +480,23 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
         }
         /* BIP-style scanning with many matches can be quadratic in n_tx_outputs.
          * To keep runtime reasonable, we only benchmark the common-case (no match) here. */
+#if SP_BENCH_BIP_BENCH_MATCH
+        {
+            /* This uses the "truth-machine" L x N configuration. */
+            size_t li, oi;
+            for (oi = 0; oi < sizeof(num_outputs_bench)/sizeof(num_outputs_bench[0]); oi++) {
+                for (li = 0; li < sizeof(num_labels_bench)/sizeof(num_labels_bench[0]); li++) {
+                    const int num_labels = num_labels_bench[li];
+                    const int num_outputs = num_outputs_bench[oi];
+                    char str[128];
+                    data.num_labels = num_labels;
+                    data.num_outputs = num_outputs;
+                    sprintf(str, "silentpayments_scan_match_bip_%s_N=%i_L=%i", order_tag, num_outputs, num_labels);
+                    run_benchmark(str, bench_silentpayments_scan_bip_match, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 1, 1);
+                }
+            }
+        }
+#endif
         printf("\n");
     }
 
