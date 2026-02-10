@@ -564,6 +564,80 @@ int secp256k1_silentpayments_recipient_prevouts_summary_create(
     return 1;
 }
 
+/* Compare function needed for lexicographicaly sorting a list of taproot outputs
+ * (constisting of raw 32 bytes x-only public keys each). */
+static int secp256k1_silentpayments_tx_outputs_sort_cmp(const void* out1, const void* out2, void *cmp_data) {
+    (void)cmp_data;
+    return secp256k1_memcmp_var(*(const unsigned char**)out1, *(const unsigned char**)out2, 32);
+}
+
+/* Given a list of sorted taproot outputs (consisting of raw 32 bytes x-only public keys each)
+ * and a single taproot output to look for, find the index of that output via binary search.
+ * Returns -1 if nothing was found. */
+static int secp256k1_silentpayments_tx_output_find(const unsigned char **tx_outputs_sorted, size_t n_tx_outputs, const unsigned char *tx_output) {
+    size_t low = 0;
+    size_t high = n_tx_outputs;
+
+    while (low < high) {
+        size_t mid = (low + high) / 2;
+        int cmp = secp256k1_memcmp_var(tx_output, tx_outputs_sorted[mid], 32);
+        if (cmp == 0) {
+            return (int)mid;
+        } else if (cmp < 0) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return -1;
+}
+
+/* Like secp256k1_silentpayments_tx_output_find, but skips outputs that were already consumed.
+ *
+ * The sorted list contains pointers into a contiguous serialization buffer `tx_outputs_ser` of
+ * length n_tx_outputs*32 (stride 32). The `used[]` array is indexed by this original output
+ * index. Returns the original output index or -1 if nothing was found. */
+static int secp256k1_silentpayments_tx_output_find_unused(const unsigned char **tx_outputs_sorted, size_t n_tx_outputs, const unsigned char *tx_output, const unsigned char *tx_outputs_ser, const unsigned char *used) {
+    int idx = secp256k1_silentpayments_tx_output_find(tx_outputs_sorted, n_tx_outputs, tx_output);
+    int left, right;
+
+    if (idx == -1) {
+        return -1;
+    }
+
+    /* Convert pointer back to original output index. */
+    {
+        const ptrdiff_t off = tx_outputs_sorted[idx] - tx_outputs_ser;
+        const size_t orig = (size_t)(off / 32);
+        if (off >= 0 && (off % 32) == 0 && orig < n_tx_outputs && !used[orig]) {
+            return (int)orig;
+        }
+    }
+
+    /* Handle duplicate x-only outputs: scan neighbors for an unused match. */
+    for (left = idx - 1; left >= 0; left--) {
+        if (secp256k1_memcmp_var(tx_output, tx_outputs_sorted[left], 32) != 0) break;
+        {
+            const ptrdiff_t off = tx_outputs_sorted[left] - tx_outputs_ser;
+            const size_t orig = (size_t)(off / 32);
+            if (off >= 0 && (off % 32) == 0 && orig < n_tx_outputs && !used[orig]) {
+                return (int)orig;
+            }
+        }
+    }
+    for (right = idx + 1; (size_t)right < n_tx_outputs; right++) {
+        if (secp256k1_memcmp_var(tx_output, tx_outputs_sorted[right], 32) != 0) break;
+        {
+            const ptrdiff_t off = tx_outputs_sorted[right] - tx_outputs_ser;
+            const size_t orig = (size_t)(off / 32);
+            if (off >= 0 && (off % 32) == 0 && orig < n_tx_outputs && !used[orig]) {
+                return (int)orig;
+            }
+        }
+    }
+    return -1;
+}
+
 int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, uint32_t *n_found_outputs,
@@ -578,7 +652,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_ge spend_pubkey_ge, prevouts_pubkey_sum_ge;
     unsigned char shared_secret[33];
     uint32_t k, k_max;
-    size_t i, found_idx;
+    size_t i;
     int found, combined, valid_scan_key, ret;
     enum { SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK = 64 };
     secp256k1_ge tx_outputs_ge_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
@@ -586,6 +660,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_gej label_candidates_gej_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
     secp256k1_ge label_candidates_ge_batch[2 * SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
     unsigned char tx_outputs_xonly_ser_batch[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK][32];
+    unsigned char *tx_outputs_xonly_ser = NULL;
+    const unsigned char **tx_outputs_xonly_ser_sorted = NULL;
+    unsigned char *tx_outputs_used = NULL;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -631,20 +708,49 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Clear the scan_key_scalar since we no longer need it and leaking this value would break indistinguishability of the transaction. */
     secp256k1_scalar_clear(&scan_key_scalar);
 
-    found_idx = 0;
+    /* Precompute and sort transaction outputs to find them fast using binary search.
+     *
+     * We keep a bitmap of already-consumed outputs, so we don't have to mutate the caller's
+     * tx_outputs array (and can still handle arbitrarily shuffled output order). */
+    tx_outputs_xonly_ser = (unsigned char*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * 32);
+    tx_outputs_xonly_ser_sorted = (const unsigned char**)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_xonly_ser_sorted));
+    tx_outputs_used = (unsigned char*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs);
+    if (tx_outputs_xonly_ser == NULL || tx_outputs_xonly_ser_sorted == NULL || tx_outputs_used == NULL) {
+        free(tx_outputs_xonly_ser);
+        free(tx_outputs_xonly_ser_sorted);
+        free(tx_outputs_used);
+        secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+        return 0;
+    }
+    for (i = 0; i < n_tx_outputs; i++) {
+        secp256k1_ge out_ge;
+        if (!secp256k1_xonly_pubkey_load(ctx, &out_ge, tx_outputs[i])) {
+            free(tx_outputs_xonly_ser);
+            free(tx_outputs_xonly_ser_sorted);
+            free(tx_outputs_used);
+            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
+        secp256k1_fe_normalize_var(&out_ge.x);
+        secp256k1_fe_get_b32(&tx_outputs_xonly_ser[32 * i], &out_ge.x);
+        tx_outputs_xonly_ser_sorted[i] = &tx_outputs_xonly_ser[32 * i];
+        tx_outputs_used[i] = 0;
+    }
+    secp256k1_hsort(tx_outputs_xonly_ser_sorted, n_tx_outputs, sizeof(*tx_outputs_xonly_ser_sorted), secp256k1_silentpayments_tx_outputs_sort_cmp, NULL);
+
     /* Don't look further than the per-group recipient limit, in order to avoid quadratic scaling issues. */
     k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
-    /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
+
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
         secp256k1_ge output_ge = spend_pubkey_ge;
         secp256k1_ge output_negated_ge;
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
-        size_t j;
+        int found_idx = -1;
         unsigned char output_xonly_ser[32];
-        unsigned char tx_output_xonly_ser[32];
+        unsigned char found_output_xonly_ser[32];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -655,6 +761,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_outputs_xonly_ser);
+            free(tx_outputs_xonly_ser_sorted);
+            free(tx_outputs_used);
             return 0;
         }
 
@@ -665,6 +774,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Leaking these values would break indistinguishability of the transaction, so clear them. */
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_outputs_xonly_ser);
+            free(tx_outputs_xonly_ser_sorted);
+            free(tx_outputs_used);
             return 0;
         }
         secp256k1_fe_normalize_var(&output_ge.x);
@@ -674,49 +786,41 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        if (label_lookup == NULL) {
-            for (j = 0; j < n_tx_outputs; j++) {
-                if (!secp256k1_xonly_pubkey_serialize(ctx, tx_output_xonly_ser, tx_outputs[j])) {
-                    secp256k1_scalar_clear(&output_tweak_scalar);
-                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                    return 0;
+        found_idx = secp256k1_silentpayments_tx_output_find_unused(tx_outputs_xonly_ser_sorted, n_tx_outputs, output_xonly_ser, tx_outputs_xonly_ser, tx_outputs_used);
+        if (found_idx != -1) {
+            memcpy(found_output_xonly_ser, output_xonly_ser, sizeof(found_output_xonly_ser));
+            label_tweak = NULL;
+            found = 1;
+        } else if (label_lookup != NULL) {
+            size_t pos = 0;
+            while (pos < n_tx_outputs && !found) {
+                size_t chunk_len = 0;
+                size_t ci;
+                uint32_t idxs[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+
+                /* Collect up to CHUNK unused outputs. */
+                while (pos < n_tx_outputs && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                    if (!tx_outputs_used[pos]) {
+                        idxs[chunk_len] = (uint32_t)pos;
+                        if (!secp256k1_xonly_pubkey_load(ctx, &tx_outputs_ge_batch[chunk_len], tx_outputs[pos])) {
+                            secp256k1_scalar_clear(&output_tweak_scalar);
+                            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                            free(tx_outputs_xonly_ser);
+                            free(tx_outputs_xonly_ser_sorted);
+                            free(tx_outputs_used);
+                            return 0;
+                        }
+                        secp256k1_fe_normalize_var(&tx_outputs_ge_batch[chunk_len].x);
+                        secp256k1_fe_get_b32(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_ge_batch[chunk_len].x);
+                        chunk_len++;
+                    }
+                    pos++;
                 }
-                if (secp256k1_memcmp_var(output_xonly_ser, tx_output_xonly_ser, sizeof(output_xonly_ser)) == 0) {
-                    label_tweak = NULL;
-                    found = 1;
-                    found_idx = j;
+                if (chunk_len == 0) {
                     break;
                 }
-            }
-        } else {
-            size_t j_start;
-            size_t chunk_len;
-            size_t ci;
 
-            for (j_start = 0; j_start < n_tx_outputs; j_start += SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
-                chunk_len = n_tx_outputs - j_start;
-                if (chunk_len > SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
-                    chunk_len = SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK;
-                }
-
-                /* Load and preprocess outputs in this chunk. */
                 for (ci = 0; ci < chunk_len; ci++) {
-                    size_t j_idx = j_start + ci;
-
-                    if (!secp256k1_xonly_pubkey_load(ctx, &tx_outputs_ge_batch[ci], tx_outputs[j_idx])) {
-                        secp256k1_scalar_clear(&output_tweak_scalar);
-                        secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                        return 0;
-                    }
-                    secp256k1_fe_normalize_var(&tx_outputs_ge_batch[ci].x);
-                    secp256k1_fe_get_b32(tx_outputs_xonly_ser_batch[ci], &tx_outputs_ge_batch[ci].x);
-                    if (secp256k1_memcmp_var(output_xonly_ser, tx_outputs_xonly_ser_batch[ci], sizeof(output_xonly_ser)) == 0) {
-                        label_tweak = NULL;
-                        found = 1;
-                        found_idx = j_idx;
-                        break;
-                    }
-
                     /* Calculate scan label candidates:
                      *     label_candidate1 =  tx_output - generated_output
                      *     label_candidate2 = -tx_output - generated_output */
@@ -724,10 +828,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci], &tx_outputs_gej_batch[ci], &output_negated_ge, NULL);
                     secp256k1_gej_neg(&label_candidates_gej_batch[2 * ci + 1], &tx_outputs_gej_batch[ci]);
                     secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci + 1], &label_candidates_gej_batch[2 * ci + 1], &output_negated_ge, NULL);
-                }
-
-                if (found) {
-                    break;
                 }
 
                 /* Convert candidates back to affine coordinates using batch inversion for performance. */
@@ -741,7 +841,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     label_tweak = label_lookup(label33, label_context);
                     if (label_tweak != NULL) {
                         found = 1;
-                        found_idx = j_start + ci;
+                        found_idx = (int)idxs[ci];
                         label_ge = label_candidates_ge_batch[2 * ci];
                         break;
                     }
@@ -749,13 +849,10 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     label_tweak = label_lookup(label33, label_context);
                     if (label_tweak != NULL) {
                         found = 1;
-                        found_idx = j_start + ci;
+                        found_idx = (int)idxs[ci];
                         label_ge = label_candidates_ge_batch[2 * ci + 1];
                         break;
                     }
-                }
-                if (found) {
-                    break;
                 }
             }
         }
@@ -785,8 +882,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 /* Set the label to an invalid value. */
                 memset(&found_outputs[k]->label, 0, sizeof(found_outputs[k]->label));
             }
-            /* Reset everything for the next round of scanning. */
-            label_tweak = NULL;
+            /* Mark output as consumed. */
+            tx_outputs_used[found_idx] = 1;
         } else {
             secp256k1_scalar_clear(&output_tweak_scalar);
             break;
@@ -796,6 +893,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+    free(tx_outputs_xonly_ser);
+    free(tx_outputs_xonly_ser_sorted);
+    free(tx_outputs_used);
     return 1;
 }
 
