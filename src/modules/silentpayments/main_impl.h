@@ -663,6 +663,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     unsigned char *tx_outputs_xonly_ser = NULL;
     const unsigned char **tx_outputs_xonly_ser_sorted = NULL;
     unsigned char *tx_outputs_used = NULL;
+    secp256k1_ge *tx_outputs_ge = NULL;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -715,10 +716,12 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     tx_outputs_xonly_ser = (unsigned char*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * 32);
     tx_outputs_xonly_ser_sorted = (const unsigned char**)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_xonly_ser_sorted));
     tx_outputs_used = (unsigned char*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs);
-    if (tx_outputs_xonly_ser == NULL || tx_outputs_xonly_ser_sorted == NULL || tx_outputs_used == NULL) {
+    tx_outputs_ge = (secp256k1_ge*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_ge));
+    if (tx_outputs_xonly_ser == NULL || tx_outputs_xonly_ser_sorted == NULL || tx_outputs_used == NULL || tx_outputs_ge == NULL) {
         free(tx_outputs_xonly_ser);
         free(tx_outputs_xonly_ser_sorted);
         free(tx_outputs_used);
+        free(tx_outputs_ge);
         secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
         return 0;
     }
@@ -728,10 +731,12 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser);
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
+            free(tx_outputs_ge);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             return 0;
         }
         secp256k1_fe_normalize_var(&out_ge.x);
+        tx_outputs_ge[i] = out_ge;
         secp256k1_fe_get_b32(&tx_outputs_xonly_ser[32 * i], &out_ge.x);
         tx_outputs_xonly_ser_sorted[i] = &tx_outputs_xonly_ser[32 * i];
         tx_outputs_used[i] = 0;
@@ -764,6 +769,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser);
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
+            free(tx_outputs_ge);
             return 0;
         }
 
@@ -777,6 +783,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser);
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
+            free(tx_outputs_ge);
             return 0;
         }
         secp256k1_fe_normalize_var(&output_ge.x);
@@ -802,16 +809,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 while (pos < n_tx_outputs && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
                     if (!tx_outputs_used[pos]) {
                         idxs[chunk_len] = (uint32_t)pos;
-                        if (!secp256k1_xonly_pubkey_load(ctx, &tx_outputs_ge_batch[chunk_len], tx_outputs[pos])) {
-                            secp256k1_scalar_clear(&output_tweak_scalar);
-                            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                            free(tx_outputs_xonly_ser);
-                            free(tx_outputs_xonly_ser_sorted);
-                            free(tx_outputs_used);
-                            return 0;
-                        }
-                        secp256k1_fe_normalize_var(&tx_outputs_ge_batch[chunk_len].x);
-                        secp256k1_fe_get_b32(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_ge_batch[chunk_len].x);
+                        tx_outputs_ge_batch[chunk_len] = tx_outputs_ge[pos];
+                        memcpy(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_xonly_ser[32 * pos], 32);
                         chunk_len++;
                     }
                     pos++;
@@ -896,6 +895,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     free(tx_outputs_xonly_ser);
     free(tx_outputs_xonly_ser_sorted);
     free(tx_outputs_used);
+    free(tx_outputs_ge);
     return 1;
 }
 
