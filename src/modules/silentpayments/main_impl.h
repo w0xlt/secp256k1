@@ -664,6 +664,15 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     const unsigned char **tx_outputs_xonly_ser_sorted = NULL;
     unsigned char *tx_outputs_used = NULL;
     secp256k1_ge *tx_outputs_ge = NULL;
+    typedef struct {
+        secp256k1_ge spend_ge; /* spend_pubkey + label */
+        secp256k1_ge label_ge;
+        unsigned char label33[33];
+        unsigned char label_tweak[32];
+    } secp256k1_silentpayments_cached_label;
+    secp256k1_silentpayments_cached_label *cached_labels = NULL;
+    size_t cached_labels_len = 0;
+    size_t cached_labels_cap = 0;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -756,6 +765,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         int found_idx = -1;
         unsigned char output_xonly_ser[32];
         unsigned char found_output_xonly_ser[32];
+        unsigned char candidate_xonly_ser[32];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -770,6 +780,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(cached_labels);
             return 0;
         }
 
@@ -784,6 +795,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(cached_labels);
             return 0;
         }
         secp256k1_fe_normalize_var(&output_ge.x);
@@ -798,7 +810,40 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             memcpy(found_output_xonly_ser, output_xonly_ser, sizeof(found_output_xonly_ser));
             label_tweak = NULL;
             found = 1;
-        } else if (label_lookup != NULL) {
+        }
+
+        /* If we already discovered labels in this scan group, try matching against their derived spend keys.
+         * This is output-order independent and avoids rescanning the full tx output set after the first
+         * label discovery. */
+        if (!found && cached_labels_len > 0) {
+            size_t li;
+            for (li = 0; li < cached_labels_len; li++) {
+                secp256k1_ge labeled_output_ge = cached_labels[li].spend_ge;
+                if (!secp256k1_eckey_pubkey_tweak_add(&labeled_output_ge, &output_tweak_scalar)) {
+                    /* This is extremely unlikely to happen (requires tweak*G to negate the spend key). */
+                    secp256k1_scalar_clear(&output_tweak_scalar);
+                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                    free(tx_outputs_xonly_ser);
+                    free(tx_outputs_xonly_ser_sorted);
+                    free(tx_outputs_used);
+                    free(tx_outputs_ge);
+                    free(cached_labels);
+                    return 0;
+                }
+                secp256k1_fe_normalize_var(&labeled_output_ge.x);
+                secp256k1_fe_get_b32(candidate_xonly_ser, &labeled_output_ge.x);
+                found_idx = secp256k1_silentpayments_tx_output_find_unused(tx_outputs_xonly_ser_sorted, n_tx_outputs, candidate_xonly_ser, tx_outputs_xonly_ser, tx_outputs_used);
+                if (found_idx != -1) {
+                    memcpy(found_output_xonly_ser, candidate_xonly_ser, sizeof(found_output_xonly_ser));
+                    label_tweak = cached_labels[li].label_tweak;
+                    label_ge = cached_labels[li].label_ge;
+                    found = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!found && label_lookup != NULL) {
             size_t pos = 0;
             while (pos < n_tx_outputs && !found) {
                 size_t chunk_len = 0;
@@ -854,6 +899,61 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     }
                 }
             }
+
+            /* If we discovered a label, cache its derived spend key for subsequent k values. */
+            if (found && label_tweak != NULL) {
+                unsigned char label33[33];
+                size_t li;
+                int known = 0;
+
+                secp256k1_eckey_pubkey_serialize33(&label_ge, label33);
+                for (li = 0; li < cached_labels_len; li++) {
+                    if (secp256k1_memcmp_var(cached_labels[li].label33, label33, sizeof(label33)) == 0) {
+                        /* Use our stable copy of the label tweak. */
+                        label_tweak = cached_labels[li].label_tweak;
+                        known = 1;
+                        break;
+                    }
+                }
+                if (!known) {
+                    secp256k1_gej labeled_spend_gej;
+                    secp256k1_ge labeled_spend_ge;
+
+                    if (cached_labels_len == cached_labels_cap) {
+                        size_t new_cap = cached_labels_cap == 0 ? 4 : cached_labels_cap * 2;
+                        secp256k1_silentpayments_cached_label *new_labels = (secp256k1_silentpayments_cached_label*)checked_malloc(&ctx->error_callback, new_cap * sizeof(*new_labels));
+                        if (new_labels == NULL) {
+                            secp256k1_scalar_clear(&output_tweak_scalar);
+                            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                            free(tx_outputs_xonly_ser);
+                            free(tx_outputs_xonly_ser_sorted);
+                            free(tx_outputs_used);
+                            free(tx_outputs_ge);
+                            free(cached_labels);
+                            return 0;
+                        }
+                        if (cached_labels_len > 0) {
+                            memcpy(new_labels, cached_labels, cached_labels_len * sizeof(*cached_labels));
+                        }
+                        free(cached_labels);
+                        cached_labels = new_labels;
+                        cached_labels_cap = new_cap;
+                    }
+
+                    /* labeled_spend = spend_pubkey + label */
+                    secp256k1_gej_set_ge(&labeled_spend_gej, &spend_pubkey_ge);
+                    secp256k1_gej_add_ge_var(&labeled_spend_gej, &labeled_spend_gej, &label_ge, NULL);
+                    secp256k1_ge_set_gej(&labeled_spend_ge, &labeled_spend_gej);
+
+                    cached_labels[cached_labels_len].spend_ge = labeled_spend_ge;
+                    cached_labels[cached_labels_len].label_ge = label_ge;
+                    memcpy(cached_labels[cached_labels_len].label33, label33, sizeof(label33));
+                    memcpy(cached_labels[cached_labels_len].label_tweak, label_tweak, 32);
+                    /* Use our stable copy of the label tweak. */
+                    label_tweak = cached_labels[cached_labels_len].label_tweak;
+                    cached_labels_len++;
+                }
+            }
         }
         if (found) {
             found_outputs[k]->output = *tx_outputs[found_idx];
@@ -896,6 +996,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     free(tx_outputs_xonly_ser_sorted);
     free(tx_outputs_used);
     free(tx_outputs_ge);
+    free(cached_labels);
     return 1;
 }
 
