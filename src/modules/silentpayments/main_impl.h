@@ -664,6 +664,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     const unsigned char **tx_outputs_xonly_ser_sorted = NULL;
     unsigned char *tx_outputs_used = NULL;
     secp256k1_ge *tx_outputs_ge = NULL;
+    secp256k1_gej *variant_out_gej = NULL;
+    secp256k1_ge *variant_out_ge = NULL;
+    size_t variant_out_cap = 0;
     typedef struct {
         secp256k1_ge spend_ge; /* spend_pubkey + label */
         secp256k1_ge label_ge;
@@ -752,20 +755,36 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     }
     secp256k1_hsort(tx_outputs_xonly_ser_sorted, n_tx_outputs, sizeof(*tx_outputs_xonly_ser_sorted), secp256k1_silentpayments_tx_outputs_sort_cmp, NULL);
 
+    /* Temporary storage for output candidates (unlabeled + any labels discovered during this scan). */
+    variant_out_cap = 4;
+    variant_out_gej = (secp256k1_gej*)checked_malloc(&ctx->error_callback, variant_out_cap * sizeof(*variant_out_gej));
+    variant_out_ge = (secp256k1_ge*)checked_malloc(&ctx->error_callback, variant_out_cap * sizeof(*variant_out_ge));
+    if (variant_out_gej == NULL || variant_out_ge == NULL) {
+        free(tx_outputs_xonly_ser);
+        free(tx_outputs_xonly_ser_sorted);
+        free(tx_outputs_used);
+        free(tx_outputs_ge);
+        free(variant_out_gej);
+        free(variant_out_ge);
+        secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+        return 0;
+    }
+
     /* Don't look further than the per-group recipient limit, in order to avoid quadratic scaling issues. */
     k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
 
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
-        secp256k1_ge output_ge = spend_pubkey_ge;
         secp256k1_ge output_negated_ge;
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
         int found_idx = -1;
-        unsigned char output_xonly_ser[32];
         unsigned char found_output_xonly_ser[32];
         unsigned char candidate_xonly_ser[32];
+        secp256k1_gej tweak_gej;
+        size_t variants_len;
+        size_t vi;
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -780,71 +799,90 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(variant_out_gej);
+            free(variant_out_ge);
             free(cached_labels);
             return 0;
         }
-
-        /* Calculate output = spend_pubkey + output_tweak * G.
-         * This can fail if output_tweak * G is the negation of spend_pubkey, but this happens only with
-         * negligible probability for honestly created spend_pubkey as output_tweak is the output of a hash function. */
-        if (!secp256k1_eckey_pubkey_tweak_add(&output_ge, &output_tweak_scalar)) {
-            /* Leaking these values would break indistinguishability of the transaction, so clear them. */
-            secp256k1_scalar_clear(&output_tweak_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-            free(tx_outputs_xonly_ser);
-            free(tx_outputs_xonly_ser_sorted);
-            free(tx_outputs_used);
-            free(tx_outputs_ge);
-            free(cached_labels);
-            return 0;
-        }
-        secp256k1_fe_normalize_var(&output_ge.x);
-        secp256k1_fe_get_b32(output_xonly_ser, &output_ge.x);
-
-        /* Calculate output_negated = -output */
-        secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        found_idx = secp256k1_silentpayments_tx_output_find_unused(tx_outputs_xonly_ser_sorted, n_tx_outputs, output_xonly_ser, tx_outputs_xonly_ser, tx_outputs_used);
-        if (found_idx != -1) {
-            memcpy(found_output_xonly_ser, output_xonly_ser, sizeof(found_output_xonly_ser));
-            label_tweak = NULL;
-            found = 1;
+        /* Compute tweak*G once (used for unlabeled spend and any discovered labeled spend keys). */
+        secp256k1_ecmult_gen(&ctx->ecmult_gen_ctx, &tweak_gej, &output_tweak_scalar);
+
+        variants_len = 1 + cached_labels_len;
+        if (variants_len > variant_out_cap) {
+            size_t new_cap = variant_out_cap;
+            secp256k1_gej *new_out_gej;
+            secp256k1_ge *new_out_ge;
+            while (new_cap < variants_len) new_cap *= 2;
+            new_out_gej = (secp256k1_gej*)checked_malloc(&ctx->error_callback, new_cap * sizeof(*new_out_gej));
+            new_out_ge = (secp256k1_ge*)checked_malloc(&ctx->error_callback, new_cap * sizeof(*new_out_ge));
+            if (new_out_gej == NULL || new_out_ge == NULL) {
+                free(new_out_gej);
+                free(new_out_ge);
+                secp256k1_scalar_clear(&output_tweak_scalar);
+                secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                free(tx_outputs_xonly_ser);
+                free(tx_outputs_xonly_ser_sorted);
+                free(tx_outputs_used);
+                free(tx_outputs_ge);
+                free(variant_out_gej);
+                free(variant_out_ge);
+                free(cached_labels);
+                return 0;
+            }
+            free(variant_out_gej);
+            free(variant_out_ge);
+            variant_out_gej = new_out_gej;
+            variant_out_ge = new_out_ge;
+            variant_out_cap = new_cap;
         }
 
-        /* If we already discovered labels in this scan group, try matching against their derived spend keys.
-         * This is output-order independent and avoids rescanning the full tx output set after the first
-         * label discovery. */
-        if (!found && cached_labels_len > 0) {
-            size_t li;
-            for (li = 0; li < cached_labels_len; li++) {
-                secp256k1_ge labeled_output_ge = cached_labels[li].spend_ge;
-                if (!secp256k1_eckey_pubkey_tweak_add(&labeled_output_ge, &output_tweak_scalar)) {
-                    /* This is extremely unlikely to happen (requires tweak*G to negate the spend key). */
-                    secp256k1_scalar_clear(&output_tweak_scalar);
-                    secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                    free(tx_outputs_xonly_ser);
-                    free(tx_outputs_xonly_ser_sorted);
-                    free(tx_outputs_used);
-                    free(tx_outputs_ge);
-                    free(cached_labels);
-                    return 0;
+        /* Compute output candidates for unlabeled spend key and all cached labeled spend keys. */
+        secp256k1_gej_add_ge_var(&variant_out_gej[0], &tweak_gej, &spend_pubkey_ge, NULL);
+        for (vi = 1; vi < variants_len; vi++) {
+            secp256k1_gej_add_ge_var(&variant_out_gej[vi], &tweak_gej, &cached_labels[vi - 1].spend_ge, NULL);
+        }
+        secp256k1_ge_set_all_gej_var(variant_out_ge, variant_out_gej, variants_len);
+
+        /* Try to find a matching output for this k among all variants. */
+        for (vi = 0; vi < variants_len; vi++) {
+            if (secp256k1_ge_is_infinity(&variant_out_ge[vi])) {
+                continue;
+            }
+            secp256k1_fe_normalize_var(&variant_out_ge[vi].x);
+            secp256k1_fe_get_b32(candidate_xonly_ser, &variant_out_ge[vi].x);
+            found_idx = secp256k1_silentpayments_tx_output_find_unused(tx_outputs_xonly_ser_sorted, n_tx_outputs, candidate_xonly_ser, tx_outputs_xonly_ser, tx_outputs_used);
+            if (found_idx != -1) {
+                memcpy(found_output_xonly_ser, candidate_xonly_ser, sizeof(found_output_xonly_ser));
+                if (vi == 0) {
+                    label_tweak = NULL;
+                } else {
+                    label_tweak = cached_labels[vi - 1].label_tweak;
+                    label_ge = cached_labels[vi - 1].label_ge;
                 }
-                secp256k1_fe_normalize_var(&labeled_output_ge.x);
-                secp256k1_fe_get_b32(candidate_xonly_ser, &labeled_output_ge.x);
-                found_idx = secp256k1_silentpayments_tx_output_find_unused(tx_outputs_xonly_ser_sorted, n_tx_outputs, candidate_xonly_ser, tx_outputs_xonly_ser, tx_outputs_used);
-                if (found_idx != -1) {
-                    memcpy(found_output_xonly_ser, candidate_xonly_ser, sizeof(found_output_xonly_ser));
-                    label_tweak = cached_labels[li].label_tweak;
-                    label_ge = cached_labels[li].label_ge;
-                    found = 1;
-                    break;
-                }
+                found = 1;
+                break;
             }
         }
 
         if (!found && label_lookup != NULL) {
             size_t pos = 0;
+            if (secp256k1_ge_is_infinity(&variant_out_ge[0])) {
+                /* This is extremely unlikely to happen (requires tweak*G to negate the spend key). */
+                secp256k1_scalar_clear(&output_tweak_scalar);
+                secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                free(tx_outputs_xonly_ser);
+                free(tx_outputs_xonly_ser_sorted);
+                free(tx_outputs_used);
+                free(tx_outputs_ge);
+                free(variant_out_gej);
+                free(variant_out_ge);
+                free(cached_labels);
+                return 0;
+            }
+            /* Calculate output_negated = -unlabeled_output */
+            secp256k1_ge_neg(&output_negated_ge, &variant_out_ge[0]);
             while (pos < n_tx_outputs && !found) {
                 size_t chunk_len = 0;
                 size_t ci;
@@ -929,6 +967,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                             free(tx_outputs_xonly_ser_sorted);
                             free(tx_outputs_used);
                             free(tx_outputs_ge);
+                            free(variant_out_gej);
+                            free(variant_out_ge);
                             free(cached_labels);
                             return 0;
                         }
@@ -996,6 +1036,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     free(tx_outputs_xonly_ser_sorted);
     free(tx_outputs_used);
     free(tx_outputs_ge);
+    free(variant_out_gej);
+    free(variant_out_ge);
     free(cached_labels);
     return 1;
 }
