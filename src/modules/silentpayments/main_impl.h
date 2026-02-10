@@ -321,11 +321,6 @@ int secp256k1_silentpayments_sender_create_outputs(
         }
         current_scan_pubkey = recipients[i]->scan_pubkey;
         k++;
-        /* Once the number of created outputs for the current recipient group exceeds the
-         * protocol limit, fail, as the recipient isn't guaranteed to find further ouputs. */
-        if (k > SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) {
-            return 0;
-        }
     }
     secp256k1_scalar_clear(&seckey_sum_scalar);
     secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -623,9 +618,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_scalar_clear(&scan_key_scalar);
 
     found_idx = 0;
-    /* Don't look further than the per-group recipient limit, in order to avoid quadratic scaling issues. */
-    k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
-             n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
+    /* Scan all outputs in the transaction. */
+    ARG_CHECK(n_tx_outputs <= UINT32_MAX);
+    k_max = (uint32_t)n_tx_outputs;
     /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
