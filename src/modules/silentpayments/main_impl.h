@@ -659,6 +659,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_gej *variant_out_gej = NULL;
     secp256k1_ge *variant_out_ge = NULL;
     size_t variant_out_cap = 0;
+    enum { SECP256K1_SILENTPAYMENTS_MAX_CACHED_LABELS = 16 };
     typedef struct {
         secp256k1_ge spend_ge; /* spend_pubkey + label */
         secp256k1_ge label_ge;
@@ -668,6 +669,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_silentpayments_cached_label *cached_labels = NULL;
     size_t cached_labels_len = 0;
     size_t cached_labels_cap = 0;
+    size_t cached_labels_next = 0;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -762,6 +764,21 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         free(variant_out_ge);
         secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
         return 0;
+    }
+
+    if (label_lookup != NULL) {
+        cached_labels_cap = SECP256K1_SILENTPAYMENTS_MAX_CACHED_LABELS;
+        cached_labels = (secp256k1_silentpayments_cached_label*)checked_malloc(&ctx->error_callback, cached_labels_cap * sizeof(*cached_labels));
+        if (cached_labels == NULL) {
+            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_outputs_xonly_ser);
+            free(tx_outputs_xonly_ser_sorted);
+            free(tx_outputs_used);
+            free(tx_outputs_ge);
+            free(variant_out_gej);
+            free(variant_out_ge);
+            return 0;
+        }
     }
 
     k_max = (uint32_t)n_tx_outputs;
@@ -948,41 +965,31 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     secp256k1_gej labeled_spend_gej;
                     secp256k1_ge labeled_spend_ge;
 
-                    if (cached_labels_len == cached_labels_cap) {
-                        size_t new_cap = cached_labels_cap == 0 ? 4 : cached_labels_cap * 2;
-                        secp256k1_silentpayments_cached_label *new_labels = (secp256k1_silentpayments_cached_label*)checked_malloc(&ctx->error_callback, new_cap * sizeof(*new_labels));
-                        if (new_labels == NULL) {
-                            secp256k1_scalar_clear(&output_tweak_scalar);
-                            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-                            free(tx_outputs_xonly_ser);
-                            free(tx_outputs_xonly_ser_sorted);
-                            free(tx_outputs_used);
-                            free(tx_outputs_ge);
-                            free(variant_out_gej);
-                            free(variant_out_ge);
-                            free(cached_labels);
-                            return 0;
-                        }
-                        if (cached_labels_len > 0) {
-                            memcpy(new_labels, cached_labels, cached_labels_len * sizeof(*cached_labels));
-                        }
-                        free(cached_labels);
-                        cached_labels = new_labels;
-                        cached_labels_cap = new_cap;
-                    }
-
                     /* labeled_spend = spend_pubkey + label */
                     secp256k1_gej_set_ge(&labeled_spend_gej, &spend_pubkey_ge);
                     secp256k1_gej_add_ge_var(&labeled_spend_gej, &labeled_spend_gej, &label_ge, NULL);
                     secp256k1_ge_set_gej(&labeled_spend_ge, &labeled_spend_gej);
 
-                    cached_labels[cached_labels_len].spend_ge = labeled_spend_ge;
-                    cached_labels[cached_labels_len].label_ge = label_ge;
-                    memcpy(cached_labels[cached_labels_len].label33, label33, sizeof(label33));
-                    memcpy(cached_labels[cached_labels_len].label_tweak, label_tweak, 32);
-                    /* Use our stable copy of the label tweak. */
-                    label_tweak = cached_labels[cached_labels_len].label_tweak;
-                    cached_labels_len++;
+                    {
+                        size_t ins;
+                        VERIFY_CHECK(cached_labels != NULL);
+                        VERIFY_CHECK(cached_labels_cap > 0);
+
+                        if (cached_labels_len < cached_labels_cap) {
+                            ins = cached_labels_len;
+                            cached_labels_len++;
+                        } else {
+                            ins = cached_labels_next;
+                            cached_labels_next = (cached_labels_next + 1) % cached_labels_cap;
+                        }
+
+                        cached_labels[ins].spend_ge = labeled_spend_ge;
+                        cached_labels[ins].label_ge = label_ge;
+                        memcpy(cached_labels[ins].label33, label33, sizeof(label33));
+                        memcpy(cached_labels[ins].label_tweak, label_tweak, 32);
+                        /* Use our stable copy of the label tweak. */
+                        label_tweak = cached_labels[ins].label_tweak;
+                    }
                 }
             }
         }
