@@ -875,7 +875,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         }
 
         if (!found && label_lookup != NULL) {
-            size_t pos = 0;
+            size_t pos;
+            size_t scanned = 0;
+            unsigned char scan_start32[32];
             if (secp256k1_ge_is_infinity(&variant_out_ge[0])) {
                 /* This is extremely unlikely to happen (requires tweak*G to negate the spend key). */
                 secp256k1_scalar_clear(&output_tweak_scalar);
@@ -891,20 +893,30 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             }
             /* Calculate output_negated = -unlabeled_output */
             secp256k1_ge_neg(&output_negated_ge, &variant_out_ge[0]);
-            while (pos < n_tx_outputs && !found) {
+
+            /* Iterate transaction outputs in a secret, per-k rotated order. This prevents an
+             * adversarial sender from forcing the labeled output to always appear last. */
+            secp256k1_scalar_get_b32(scan_start32, &output_tweak_scalar);
+            pos = (size_t)(secp256k1_read_be64(scan_start32) % n_tx_outputs);
+
+            while (scanned < n_tx_outputs && !found) {
                 size_t chunk_len = 0;
                 size_t ci;
                 uint32_t idxs[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
 
                 /* Collect up to CHUNK unused outputs. */
-                while (pos < n_tx_outputs && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
-                    if (!tx_outputs_used[pos]) {
-                        idxs[chunk_len] = (uint32_t)pos;
-                        tx_outputs_ge_batch[chunk_len] = tx_outputs_ge[pos];
-                        memcpy(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_xonly_ser[32 * pos], 32);
+                while (scanned < n_tx_outputs && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                    const size_t idx = pos;
+                    pos++;
+                    if (pos == n_tx_outputs) pos = 0;
+                    scanned++;
+
+                    if (!tx_outputs_used[idx]) {
+                        idxs[chunk_len] = (uint32_t)idx;
+                        tx_outputs_ge_batch[chunk_len] = tx_outputs_ge[idx];
+                        memcpy(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_xonly_ser[32 * idx], 32);
                         chunk_len++;
                     }
-                    pos++;
                 }
                 if (chunk_len == 0) {
                     break;
