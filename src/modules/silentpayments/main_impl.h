@@ -656,6 +656,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     const unsigned char **tx_outputs_xonly_ser_sorted = NULL;
     unsigned char *tx_outputs_used = NULL;
     secp256k1_ge *tx_outputs_ge = NULL;
+    uint32_t *tx_outputs_unused = NULL;
+    uint32_t *tx_outputs_unused_pos = NULL;
+    size_t tx_outputs_unused_len = 0;
     secp256k1_gej *variant_out_gej = NULL;
     secp256k1_ge *variant_out_ge = NULL;
     size_t variant_out_cap = 0;
@@ -725,11 +728,16 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     tx_outputs_xonly_ser_sorted = (const unsigned char**)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_xonly_ser_sorted));
     tx_outputs_used = (unsigned char*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs);
     tx_outputs_ge = (secp256k1_ge*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_ge));
-    if (tx_outputs_xonly_ser == NULL || tx_outputs_xonly_ser_sorted == NULL || tx_outputs_used == NULL || tx_outputs_ge == NULL) {
+    tx_outputs_unused = (uint32_t*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_unused));
+    tx_outputs_unused_pos = (uint32_t*)checked_malloc(&ctx->error_callback, (size_t)n_tx_outputs * sizeof(*tx_outputs_unused_pos));
+    if (tx_outputs_xonly_ser == NULL || tx_outputs_xonly_ser_sorted == NULL || tx_outputs_used == NULL || tx_outputs_ge == NULL ||
+        tx_outputs_unused == NULL || tx_outputs_unused_pos == NULL) {
         free(tx_outputs_xonly_ser);
         free(tx_outputs_xonly_ser_sorted);
         free(tx_outputs_used);
         free(tx_outputs_ge);
+        free(tx_outputs_unused);
+        free(tx_outputs_unused_pos);
         secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
         return 0;
     }
@@ -740,6 +748,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(tx_outputs_unused);
+            free(tx_outputs_unused_pos);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             return 0;
         }
@@ -748,7 +758,10 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         secp256k1_fe_get_b32(&tx_outputs_xonly_ser[32 * i], &out_ge.x);
         tx_outputs_xonly_ser_sorted[i] = &tx_outputs_xonly_ser[32 * i];
         tx_outputs_used[i] = 0;
+        tx_outputs_unused[i] = (uint32_t)i;
+        tx_outputs_unused_pos[i] = (uint32_t)i;
     }
+    tx_outputs_unused_len = n_tx_outputs;
     secp256k1_hsort(tx_outputs_xonly_ser_sorted, n_tx_outputs, sizeof(*tx_outputs_xonly_ser_sorted), secp256k1_silentpayments_tx_outputs_sort_cmp, NULL);
 
     /* Temporary storage for output candidates (unlabeled + any labels discovered during this scan). */
@@ -760,6 +773,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         free(tx_outputs_xonly_ser_sorted);
         free(tx_outputs_used);
         free(tx_outputs_ge);
+        free(tx_outputs_unused);
+        free(tx_outputs_unused_pos);
         free(variant_out_gej);
         free(variant_out_ge);
         secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
@@ -775,6 +790,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(tx_outputs_unused);
+            free(tx_outputs_unused_pos);
             free(variant_out_gej);
             free(variant_out_ge);
             return 0;
@@ -807,6 +824,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             free(tx_outputs_xonly_ser_sorted);
             free(tx_outputs_used);
             free(tx_outputs_ge);
+            free(tx_outputs_unused);
+            free(tx_outputs_unused_pos);
             free(variant_out_gej);
             free(variant_out_ge);
             free(cached_labels);
@@ -834,6 +853,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 free(tx_outputs_xonly_ser_sorted);
                 free(tx_outputs_used);
                 free(tx_outputs_ge);
+                free(tx_outputs_unused);
+                free(tx_outputs_unused_pos);
                 free(variant_out_gej);
                 free(variant_out_ge);
                 free(cached_labels);
@@ -886,6 +907,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 free(tx_outputs_xonly_ser_sorted);
                 free(tx_outputs_used);
                 free(tx_outputs_ge);
+                free(tx_outputs_unused);
+                free(tx_outputs_unused_pos);
                 free(variant_out_gej);
                 free(variant_out_ge);
                 free(cached_labels);
@@ -897,63 +920,65 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Iterate transaction outputs in a secret, per-k rotated order. This prevents an
              * adversarial sender from forcing the labeled output to always appear last. */
             secp256k1_scalar_get_b32(scan_start32, &output_tweak_scalar);
-            pos = (size_t)(secp256k1_read_be64(scan_start32) % n_tx_outputs);
+            if (tx_outputs_unused_len > 0) {
+                pos = (size_t)(secp256k1_read_be64(scan_start32) % tx_outputs_unused_len);
 
-            while (scanned < n_tx_outputs && !found) {
-                size_t chunk_len = 0;
-                size_t ci;
-                uint32_t idxs[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
+                while (scanned < tx_outputs_unused_len && !found) {
+                    size_t chunk_len = 0;
+                    size_t ci;
+                    uint32_t idxs[SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK];
 
-                /* Collect up to CHUNK unused outputs. */
-                while (scanned < n_tx_outputs && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
-                    const size_t idx = pos;
-                    pos++;
-                    if (pos == n_tx_outputs) pos = 0;
-                    scanned++;
+                    /* Collect up to CHUNK unused outputs. */
+                    while (scanned < tx_outputs_unused_len && chunk_len < SECP256K1_SILENTPAYMENTS_BIP_BATCH_CHUNK) {
+                        const uint32_t idx32 = tx_outputs_unused[pos];
+                        const size_t idx = (size_t)idx32;
 
-                    if (!tx_outputs_used[idx]) {
-                        idxs[chunk_len] = (uint32_t)idx;
+                        pos++;
+                        if (pos == tx_outputs_unused_len) pos = 0;
+                        scanned++;
+
+                        idxs[chunk_len] = idx32;
                         tx_outputs_ge_batch[chunk_len] = tx_outputs_ge[idx];
                         memcpy(tx_outputs_xonly_ser_batch[chunk_len], &tx_outputs_xonly_ser[32 * idx], 32);
                         chunk_len++;
                     }
-                }
-                if (chunk_len == 0) {
-                    break;
-                }
-
-                for (ci = 0; ci < chunk_len; ci++) {
-                    /* Calculate scan label candidates:
-                     *     label_candidate1 =  tx_output - generated_output
-                     *     label_candidate2 = -tx_output - generated_output */
-                    secp256k1_gej_set_ge(&tx_outputs_gej_batch[ci], &tx_outputs_ge_batch[ci]);
-                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci], &tx_outputs_gej_batch[ci], &output_negated_ge, NULL);
-                    secp256k1_gej_neg(&label_candidates_gej_batch[2 * ci + 1], &tx_outputs_gej_batch[ci]);
-                    secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci + 1], &label_candidates_gej_batch[2 * ci + 1], &output_negated_ge, NULL);
-                }
-
-                /* Convert candidates back to affine coordinates using batch inversion for performance. */
-                secp256k1_ge_set_all_gej_var(label_candidates_ge_batch, label_candidates_gej_batch, 2 * chunk_len);
-
-                /* Check if any candidate in this chunk is in the label cache. */
-                for (ci = 0; ci < chunk_len; ci++) {
-                    unsigned char label33[33];
-
-                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci], label33);
-                    label_tweak = label_lookup(label33, label_context);
-                    if (label_tweak != NULL) {
-                        found = 1;
-                        found_idx = (int)idxs[ci];
-                        label_ge = label_candidates_ge_batch[2 * ci];
+                    if (chunk_len == 0) {
                         break;
                     }
-                    secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci + 1], label33);
-                    label_tweak = label_lookup(label33, label_context);
-                    if (label_tweak != NULL) {
-                        found = 1;
-                        found_idx = (int)idxs[ci];
-                        label_ge = label_candidates_ge_batch[2 * ci + 1];
-                        break;
+
+                    for (ci = 0; ci < chunk_len; ci++) {
+                        /* Calculate scan label candidates:
+                         *     label_candidate1 =  tx_output - generated_output
+                         *     label_candidate2 = -tx_output - generated_output */
+                        secp256k1_gej_set_ge(&tx_outputs_gej_batch[ci], &tx_outputs_ge_batch[ci]);
+                        secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci], &tx_outputs_gej_batch[ci], &output_negated_ge, NULL);
+                        secp256k1_gej_neg(&label_candidates_gej_batch[2 * ci + 1], &tx_outputs_gej_batch[ci]);
+                        secp256k1_gej_add_ge_var(&label_candidates_gej_batch[2 * ci + 1], &label_candidates_gej_batch[2 * ci + 1], &output_negated_ge, NULL);
+                    }
+
+                    /* Convert candidates back to affine coordinates using batch inversion for performance. */
+                    secp256k1_ge_set_all_gej_var(label_candidates_ge_batch, label_candidates_gej_batch, 2 * chunk_len);
+
+                    /* Check if any candidate in this chunk is in the label cache. */
+                    for (ci = 0; ci < chunk_len; ci++) {
+                        unsigned char label33[33];
+
+                        secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci], label33);
+                        label_tweak = label_lookup(label33, label_context);
+                        if (label_tweak != NULL) {
+                            found = 1;
+                            found_idx = (int)idxs[ci];
+                            label_ge = label_candidates_ge_batch[2 * ci];
+                            break;
+                        }
+                        secp256k1_eckey_pubkey_serialize33(&label_candidates_ge_batch[2 * ci + 1], label33);
+                        label_tweak = label_lookup(label33, label_context);
+                        if (label_tweak != NULL) {
+                            found = 1;
+                            found_idx = (int)idxs[ci];
+                            label_ge = label_candidates_ge_batch[2 * ci + 1];
+                            break;
+                        }
                     }
                 }
             }
@@ -1033,6 +1058,15 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             }
             /* Mark output as consumed. */
             tx_outputs_used[found_idx] = 1;
+            if (tx_outputs_unused_len > 0) {
+                const uint32_t found_idx32 = (uint32_t)found_idx;
+                const uint32_t found_pos32 = tx_outputs_unused_pos[found_idx32];
+                const uint32_t last_idx32 = tx_outputs_unused[(size_t)tx_outputs_unused_len - 1];
+
+                tx_outputs_unused[(size_t)found_pos32] = last_idx32;
+                tx_outputs_unused_pos[last_idx32] = found_pos32;
+                tx_outputs_unused_len--;
+            }
         } else {
             secp256k1_scalar_clear(&output_tweak_scalar);
             break;
@@ -1046,6 +1080,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     free(tx_outputs_xonly_ser_sorted);
     free(tx_outputs_used);
     free(tx_outputs_ge);
+    free(tx_outputs_unused);
+    free(tx_outputs_unused_pos);
     free(variant_out_gej);
     free(variant_out_ge);
     free(cached_labels);
