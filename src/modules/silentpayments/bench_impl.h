@@ -14,6 +14,17 @@
  *  tx fills up a full bock of taproot outputs that all go to the same scankey group) */
 #define MAX_P2TR_OUTPUTS_PER_BLOCK 23255
 
+/* Construct matching outputs using distinct labels (m = 0..K-1) rather than
+ * repeating a single labeled recipient for all matches.
+ *
+ * This simulates a sender who has collected many distinct labeled Silent Payments
+ * addresses (same scan key, different labeled spend keys). It is useful for
+ * benchmarking scenarios where "discovered label" caches inside the receiver scan
+ * do not get hits. */
+#ifndef SP_BENCH_DISTINCT_MATCH_LABELS
+#define SP_BENCH_DISTINCT_MATCH_LABELS 0
+#endif
+
 #define SP_BENCH_MAX_INPUTS  1
 #define SP_BENCH_MAX_OUTPUTS MAX_P2TR_OUTPUTS_PER_BLOCK
 
@@ -30,10 +41,105 @@ typedef struct {
     unsigned char smallest_outpoint[36];
     unsigned char label[33];
     unsigned char label_tweak[32];
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+    int num_labels;
+    unsigned char (*labels_ser)[33];
+    unsigned char (*label_tweaks)[32];
+    secp256k1_pubkey *labeled_spend_pubkeys;
+    size_t label_cache_size; /* power of two */
+    int *label_cache_idx;    /* open-addressing table: label index or -1 */
+    uint64_t *label_cache_hash; /* cached hashes for quick rejection */
+#endif
     int num_outputs;
     int num_matches;
 } bench_silentpayments_data;
 
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+static uint64_t bench_silentpayments_label33_hash(const unsigned char *label33) {
+    /* FNV-1a 64-bit */
+    uint64_t h = 14695981039346656037ULL;
+    int i;
+    for (i = 0; i < 33; i++) {
+        h ^= label33[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void bench_silentpayments_label_cache_build(bench_silentpayments_data *data) {
+    size_t cache_size, mask;
+    size_t i;
+
+    CHECK(data->num_labels > 0);
+    CHECK(data->labels_ser != NULL);
+    CHECK(data->label_tweaks != NULL);
+
+    /* Keep the table at <= 50% load to minimize probing. */
+    cache_size = 8;
+    while (cache_size < (size_t)data->num_labels * 2) {
+        if (cache_size > (SIZE_MAX >> 1)) {
+            CHECK(0);
+        }
+        cache_size <<= 1;
+    }
+    mask = cache_size - 1;
+
+    data->label_cache_idx = malloc(cache_size * sizeof(*data->label_cache_idx));
+    data->label_cache_hash = malloc(cache_size * sizeof(*data->label_cache_hash));
+    CHECK(data->label_cache_idx != NULL);
+    CHECK(data->label_cache_hash != NULL);
+    data->label_cache_size = cache_size;
+
+    for (i = 0; i < cache_size; i++) {
+        data->label_cache_idx[i] = -1;
+        data->label_cache_hash[i] = 0;
+    }
+
+    for (i = 0; i < (size_t)data->num_labels; i++) {
+        const uint64_t h = bench_silentpayments_label33_hash(data->labels_ser[i]);
+        size_t pos = (size_t)(h & (uint64_t)mask);
+        size_t steps = 0;
+        while (data->label_cache_idx[pos] != -1) {
+            pos = (pos + 1) & mask;
+            steps++;
+            if (steps >= cache_size) {
+                CHECK(0);
+            }
+        }
+        data->label_cache_idx[pos] = (int)i;
+        data->label_cache_hash[pos] = h;
+    }
+}
+
+const unsigned char* label_lookup(const unsigned char* key, const void* cache_ptr) {
+    const bench_silentpayments_data *data = (const bench_silentpayments_data*)cache_ptr;
+    size_t mask;
+    uint64_t h;
+    size_t pos;
+    size_t steps = 0;
+
+    if (data->label_cache_size == 0) {
+        return NULL;
+    }
+    mask = data->label_cache_size - 1;
+    h = bench_silentpayments_label33_hash(key);
+    pos = (size_t)(h & (uint64_t)mask);
+
+    while (data->label_cache_idx[pos] != -1) {
+        const int idx = data->label_cache_idx[pos];
+        if (data->label_cache_hash[pos] == h &&
+            secp256k1_memcmp_var(key, data->labels_ser[idx], 33) == 0) {
+            return data->label_tweaks[idx];
+        }
+        pos = (pos + 1) & mask;
+        steps++;
+        if (steps >= data->label_cache_size) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+#else
 const unsigned char* label_lookup(const unsigned char* key, const void* cache_ptr) {
     bench_silentpayments_data *data = (bench_silentpayments_data*)cache_ptr;
     if (secp256k1_memcmp_var(key, data->label, 33) == 0) {
@@ -41,6 +147,7 @@ const unsigned char* label_lookup(const unsigned char* key, const void* cache_pt
     }
     return NULL;
 }
+#endif
 
 static void bench_silentpayments_scan_setup(void* arg) {
     int i;
@@ -97,10 +204,42 @@ static void bench_silentpayments_scan_setup(void* arg) {
         CHECK(secp256k1_ec_pubkey_create(data->ctx, &scan_pubkey, data->scan_key));
         CHECK(secp256k1_ec_pubkey_create(data->ctx, &other_scan_pubkey, other_scan_seckey));
 
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+        {
+            int li;
+            int label_count = data->num_matches;
+            if (label_count < 1) label_count = 1;
+
+            data->num_labels = label_count;
+            data->labels_ser = malloc(sizeof(*data->labels_ser) * (size_t)label_count);
+            data->label_tweaks = malloc(sizeof(*data->label_tweaks) * (size_t)label_count);
+            data->labeled_spend_pubkeys = malloc(sizeof(*data->labeled_spend_pubkeys) * (size_t)label_count);
+            CHECK(data->labels_ser != NULL);
+            CHECK(data->label_tweaks != NULL);
+            CHECK(data->labeled_spend_pubkeys != NULL);
+
+            for (li = 0; li < label_count; li++) {
+                CHECK(secp256k1_silentpayments_recipient_label_create(data->ctx, &label, data->label_tweaks[li], data->scan_key, (uint32_t)li));
+                CHECK(secp256k1_silentpayments_recipient_label_serialize(data->ctx, data->labels_ser[li], &label));
+                CHECK(secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(data->ctx,
+                    &data->labeled_spend_pubkeys[li], &data->spend_pubkey, &label));
+                if (li == 0) {
+                    memcpy(data->label, data->labels_ser[0], sizeof(data->label));
+                    memcpy(data->label_tweak, data->label_tweaks[0], sizeof(data->label_tweak));
+                    labeled_spend_pubkey = data->labeled_spend_pubkeys[0];
+                }
+            }
+            data->label_cache_size = 0;
+            data->label_cache_idx = NULL;
+            data->label_cache_hash = NULL;
+            bench_silentpayments_label_cache_build(data);
+        }
+#else
         CHECK(secp256k1_silentpayments_recipient_label_create(data->ctx, &label, data->label_tweak, data->scan_key, 0));
         CHECK(secp256k1_silentpayments_recipient_label_serialize(data->ctx, data->label, &label));
         CHECK(secp256k1_silentpayments_recipient_create_labeled_spend_pubkey(data->ctx,
             &labeled_spend_pubkey, &data->spend_pubkey, &label));
+#endif
 
         data->tx_outputs = malloc(sizeof(secp256k1_xonly_pubkey) * data->num_outputs);
         data->tx_outputs_ptrs = malloc(sizeof(secp256k1_xonly_pubkey*) * data->num_outputs);
@@ -111,9 +250,17 @@ static void bench_silentpayments_scan_setup(void* arg) {
         for (i = 0; i < data->num_outputs; i++) {
             data->tx_outputs_ptrs[i] = &data->tx_outputs[i];
             recipients_ptrs[i] = &recipients[i];
-            recipients[i].spend_pubkey = labeled_spend_pubkey;
             if (i >= index_first_k) {
                 recipients[i].scan_pubkey = scan_pubkey;
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+                {
+                    const int li = i - index_first_k;
+                    CHECK(li >= 0 && li < data->num_labels);
+                    recipients[i].spend_pubkey = data->labeled_spend_pubkeys[li];
+                }
+#else
+                recipients[i].spend_pubkey = labeled_spend_pubkey;
+#endif
             } else {
                 unsigned char tweak[32] = {0};
                 tweak[31] = 1;
@@ -121,6 +268,11 @@ static void bench_silentpayments_scan_setup(void* arg) {
                  * (we want to avoid running into the recipient group protocol limit) */
                 CHECK(secp256k1_ec_pubkey_tweak_add(data->ctx, &other_scan_pubkey, tweak));
                 recipients[i].scan_pubkey = other_scan_pubkey;
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+                recipients[i].spend_pubkey = labeled_spend_pubkey; /* fixed noise spend pubkey */
+#else
+                recipients[i].spend_pubkey = labeled_spend_pubkey;
+#endif
             }
             recipients[i].index = i;
         }
@@ -151,6 +303,20 @@ static void bench_silentpayments_scan_teardown(void* arg, int iters) {
     free(data->tx_outputs_ptrs);
     free(data->found_outputs);
     free(data->found_outputs_ptrs);
+#if SP_BENCH_DISTINCT_MATCH_LABELS
+    free(data->labels_ser);
+    free(data->label_tweaks);
+    free(data->labeled_spend_pubkeys);
+    free(data->label_cache_idx);
+    free(data->label_cache_hash);
+    data->labels_ser = NULL;
+    data->label_tweaks = NULL;
+    data->labeled_spend_pubkeys = NULL;
+    data->label_cache_idx = NULL;
+    data->label_cache_hash = NULL;
+    data->label_cache_size = 0;
+    data->num_labels = 0;
+#endif
 }
 
 static void bench_silentpayments_scan(void* arg, int iters) {
