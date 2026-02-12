@@ -561,6 +561,40 @@ int secp256k1_silentpayments_recipient_prevouts_summary_create(
     return 1;
 }
 
+typedef struct {
+    unsigned char xonly32[32];
+    uint32_t idx;
+} secp256k1_silentpayments_tx_output_entry;
+
+/* Compare function for lexicographically sorting transaction outputs by their x-only serialization. */
+static int secp256k1_silentpayments_tx_output_entry_sort_cmp(const void* e1, const void* e2, void *cmp_data) {
+    const secp256k1_silentpayments_tx_output_entry *a = (const secp256k1_silentpayments_tx_output_entry *)e1;
+    const secp256k1_silentpayments_tx_output_entry *b = (const secp256k1_silentpayments_tx_output_entry *)e2;
+    (void)cmp_data;
+    return secp256k1_memcmp_var(a->xonly32, b->xonly32, sizeof(a->xonly32));
+}
+
+/* Find a transaction output via binary search in a sorted x-only output list.
+ * Returns 1 and sets *found_idx if found, or returns 0 otherwise. */
+static int secp256k1_silentpayments_tx_output_find(const secp256k1_silentpayments_tx_output_entry *tx_outputs_sorted, size_t n_tx_outputs, const unsigned char *xonly32, uint32_t *found_idx) {
+    size_t low = 0;
+    size_t high = n_tx_outputs;
+
+    while (low < high) {
+        size_t mid = (low + high) / 2;
+        int cmp = secp256k1_memcmp_var(xonly32, tx_outputs_sorted[mid].xonly32, 32);
+        if (cmp == 0) {
+            *found_idx = tx_outputs_sorted[mid].idx;
+            return 1;
+        } else if (cmp < 0) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return 0;
+}
+
 int secp256k1_silentpayments_recipient_scan_outputs(
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs, uint32_t *n_found_outputs,
@@ -575,8 +609,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     secp256k1_ge spend_pubkey_ge, prevouts_pubkey_sum_ge;
     unsigned char shared_secret[33];
     uint32_t k, k_max;
-    size_t i, found_idx;
+    size_t i;
     int found, combined, valid_scan_key, ret;
+    secp256k1_silentpayments_tx_output_entry *tx_outputs_sorted = NULL;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -622,19 +657,37 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Clear the scan_key_scalar since we no longer need it and leaking this value would break indistinguishability of the transaction. */
     secp256k1_scalar_clear(&scan_key_scalar);
 
-    found_idx = 0;
+    ARG_CHECK(n_tx_outputs <= UINT32_MAX);
+
+    /* Precompute and sort transaction outputs by their x-only serialization to find them quickly. */
+    tx_outputs_sorted = (secp256k1_silentpayments_tx_output_entry*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*tx_outputs_sorted));
+    if (tx_outputs_sorted == NULL) {
+        secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+        return 0;
+    }
+    for (i = 0; i < n_tx_outputs; i++) {
+        if (!secp256k1_xonly_pubkey_serialize(ctx, tx_outputs_sorted[i].xonly32, tx_outputs[i])) {
+            free(tx_outputs_sorted);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+            return 0;
+        }
+        tx_outputs_sorted[i].idx = (uint32_t)i;
+    }
+    secp256k1_hsort(tx_outputs_sorted, n_tx_outputs, sizeof(*tx_outputs_sorted), secp256k1_silentpayments_tx_output_entry_sort_cmp, NULL);
+
     /* Don't look further than the per-group recipient limit, in order to avoid quadratic scaling issues. */
     k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
     /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar output_tweak_scalar;
-        secp256k1_xonly_pubkey output_xonly;
         secp256k1_ge output_ge = spend_pubkey_ge;
         secp256k1_ge output_negated_ge;
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
-        size_t j;
+        /* Initialize to silence -Wconditional-uninitialized (Clang). */
+        uint32_t found_idx = 0;
+        unsigned char output_xonly_ser[32];
 
         /* Calculate the output_tweak and convert it to a scalar.
          *
@@ -645,6 +698,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         if (!secp256k1_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_outputs_sorted);
             return 0;
         }
 
@@ -655,23 +709,21 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Leaking these values would break indistinguishability of the transaction, so clear them. */
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            free(tx_outputs_sorted);
             return 0;
         }
         /* Calculate output_negated = -output */
         secp256k1_ge_neg(&output_negated_ge, &output_ge);
 
         found = 0;
-        secp256k1_xonly_pubkey_save(&output_xonly, &output_ge);
-        for (j = 0; j < n_tx_outputs; j++) {
-            if (secp256k1_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
-                label_tweak = NULL;
-                found = 1;
-                found_idx = j;
-                break;
-            }
-
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
-            if (label_lookup != NULL) {
+        secp256k1_fe_normalize_var(&output_ge.x);
+        secp256k1_fe_get_b32(output_xonly_ser, &output_ge.x);
+        if (secp256k1_silentpayments_tx_output_find(tx_outputs_sorted, n_tx_outputs, output_xonly_ser, &found_idx)) {
+            label_tweak = NULL;
+            found = 1;
+        } else if (label_lookup != NULL) {
+            size_t j;
+            for (j = 0; j < n_tx_outputs; j++) {
                 secp256k1_ge tx_output_ge;
                 secp256k1_gej tx_output_gej;
                 secp256k1_gej label_candidates_gej[2];
@@ -700,7 +752,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     label_tweak = label_lookup(label33, label_context);
                     if (label_tweak != NULL) {
                         found = 1;
-                        found_idx = j;
+                        found_idx = (uint32_t)j;
                         label_ge = label_candidates_ge[i];
                         break;
                     }
@@ -747,6 +799,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+    free(tx_outputs_sorted);
     return 1;
 }
 
