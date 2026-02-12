@@ -866,9 +866,18 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         if (!found && label_lookup != NULL) {
             enum { SECP256K1_SILENTPAYMENTS_LABEL_SCAN_CHUNK = 64 };
             size_t pos = 0;
+            size_t scanned = 0;
+            unsigned char scan_start32[32];
             /* Calculate output_negated = -unlabeled_output */
             secp256k1_ge_neg(&output_negated_ge, &variant_out_ge[0]);
-            while (pos < tx_outputs_unused_len && !found) {
+
+            if (tx_outputs_unused_len > 0) {
+                /* Rotate scan start position to avoid adversarial output ordering. */
+                secp256k1_scalar_get_b32(scan_start32, &output_tweak_scalar);
+                pos = (size_t)(secp256k1_read_be64(scan_start32) % tx_outputs_unused_len);
+            }
+
+            while (scanned < tx_outputs_unused_len && !found) {
                 size_t chunk_len = 0;
                 uint32_t idxs[SECP256K1_SILENTPAYMENTS_LABEL_SCAN_CHUNK];
                 secp256k1_ge tx_ge_batch[SECP256K1_SILENTPAYMENTS_LABEL_SCAN_CHUNK];
@@ -878,7 +887,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 size_t ci;
 
                 /* Collect up to CHUNK transaction outputs. */
-                while (pos < tx_outputs_unused_len && chunk_len < SECP256K1_SILENTPAYMENTS_LABEL_SCAN_CHUNK) {
+                while (scanned < tx_outputs_unused_len && chunk_len < SECP256K1_SILENTPAYMENTS_LABEL_SCAN_CHUNK) {
                     const uint32_t idx = tx_outputs_unused[pos];
                     idxs[chunk_len] = idx;
                     tx_ge_batch[chunk_len] = tx_outputs_ge[idx];
@@ -886,6 +895,8 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                     secp256k1_ge_neg(&tx_neg_ge_batch[chunk_len], &tx_neg_ge_batch[chunk_len]);
                     chunk_len++;
                     pos++;
+                    if (pos == tx_outputs_unused_len) pos = 0;
+                    scanned++;
                 }
 
                 for (ci = 0; ci < chunk_len; ci++) {
