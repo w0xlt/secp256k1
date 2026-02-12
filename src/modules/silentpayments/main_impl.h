@@ -621,6 +621,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     size_t i;
     int found, combined, valid_scan_key, ret;
     secp256k1_silentpayments_tx_output_entry *tx_outputs_sorted = NULL;
+    secp256k1_ge *tx_outputs_ge = NULL;
     secp256k1_silentpayments_cached_label cached_labels[SECP256K1_SILENTPAYMENTS_MAX_CACHED_LABELS];
     size_t cached_labels_len = 0;
     size_t cached_labels_next = 0;
@@ -677,13 +678,28 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
         return 0;
     }
-    for (i = 0; i < n_tx_outputs; i++) {
-        if (!secp256k1_xonly_pubkey_serialize(ctx, tx_outputs_sorted[i].xonly32, tx_outputs[i])) {
+    if (label_lookup != NULL) {
+        tx_outputs_ge = (secp256k1_ge*)checked_malloc(&ctx->error_callback, n_tx_outputs * sizeof(*tx_outputs_ge));
+        if (tx_outputs_ge == NULL) {
             free(tx_outputs_sorted);
             secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
             return 0;
         }
+    }
+    for (i = 0; i < n_tx_outputs; i++) {
+        secp256k1_ge out_ge;
+        if (!secp256k1_xonly_pubkey_load(ctx, &out_ge, tx_outputs[i])) {
+            free(tx_outputs_sorted);
+            free(tx_outputs_ge);
+            secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
+            return 0;
+        }
+        secp256k1_fe_normalize_var(&out_ge.x);
+        secp256k1_fe_get_b32(tx_outputs_sorted[i].xonly32, &out_ge.x);
         tx_outputs_sorted[i].idx = (uint32_t)i;
+        if (tx_outputs_ge != NULL) {
+            tx_outputs_ge[i] = out_ge;
+        }
     }
     secp256k1_hsort(tx_outputs_sorted, n_tx_outputs, sizeof(*tx_outputs_sorted), secp256k1_silentpayments_tx_output_entry_sort_cmp, NULL);
 
@@ -715,6 +731,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             free(tx_outputs_sorted);
+            free(tx_outputs_ge);
             return 0;
         }
 
@@ -737,6 +754,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_scalar_clear(&output_tweak_scalar);
             secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
             free(tx_outputs_sorted);
+            free(tx_outputs_ge);
             return 0;
         }
 
@@ -770,7 +788,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_gej label_candidates_gej[2];
                 secp256k1_ge label_candidates_ge[2];
 
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
+                tx_output_ge = tx_outputs_ge[j];
                 secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
                 /* Calculate scan label candidates:
                  *     label_candidate1 =  tx_output - generated_output
@@ -883,6 +901,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
     secp256k1_memclear_explicit(shared_secret, sizeof(shared_secret));
     free(tx_outputs_sorted);
+    free(tx_outputs_ge);
     return 1;
 }
 
