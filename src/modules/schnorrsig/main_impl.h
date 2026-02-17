@@ -14,7 +14,6 @@
 /* Initializes SHA256 with fixed midstate. This midstate was computed by applying
  * SHA256 to SHA256("BIP0340/nonce")||SHA256("BIP0340/nonce"). */
 static void secp256k1_nonce_function_bip340_sha256_tagged(secp256k1_sha256 *sha) {
-    secp256k1_sha256_initialize(sha);
     sha->s[0] = 0x46615b35ul;
     sha->s[1] = 0xf4bfbff7ul;
     sha->s[2] = 0x9f8dc671ul;
@@ -30,7 +29,6 @@ static void secp256k1_nonce_function_bip340_sha256_tagged(secp256k1_sha256 *sha)
 /* Initializes SHA256 with fixed midstate. This midstate was computed by applying
  * SHA256 to SHA256("BIP0340/aux")||SHA256("BIP0340/aux"). */
 static void secp256k1_nonce_function_bip340_sha256_tagged_aux(secp256k1_sha256 *sha) {
-    secp256k1_sha256_initialize(sha);
     sha->s[0] = 0x24dd3219ul;
     sha->s[1] = 0x4eba7e70ul;
     sha->s[2] = 0xca0fabb9ul;
@@ -104,7 +102,6 @@ const secp256k1_nonce_function_hardened secp256k1_nonce_function_bip340 = nonce_
 /* Initializes SHA256 with fixed midstate. This midstate was computed by applying
  * SHA256 to SHA256("BIP0340/challenge")||SHA256("BIP0340/challenge"). */
 static void secp256k1_schnorrsig_sha256_tagged(secp256k1_sha256 *sha) {
-    secp256k1_sha256_initialize(sha);
     sha->s[0] = 0x9cecba11ul;
     sha->s[1] = 0x23925381ul;
     sha->s[2] = 0x11679112ul;
