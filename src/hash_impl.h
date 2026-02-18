@@ -40,6 +40,24 @@ static void secp256k1_sha256_initialize(secp256k1_sha256 *hash) {
     hash->bytes = 0;
 }
 
+/* Initialize a SHA256 hash state with a precomputed midstate.
+ * The byte counter must be a multiple of 64, i.e., there must be no unwritten
+ * bytes in the buffer. */
+static void secp256k1_sha256_initialize_midstate(secp256k1_sha256 *hash, uint64_t bytes,
+    uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3,
+    uint32_t s4, uint32_t s5, uint32_t s6, uint32_t s7) {
+    VERIFY_CHECK((bytes & 0x3F) == 0);
+    hash->s[0] = s0;
+    hash->s[1] = s1;
+    hash->s[2] = s2;
+    hash->s[3] = s3;
+    hash->s[4] = s4;
+    hash->s[5] = s5;
+    hash->s[6] = s6;
+    hash->s[7] = s7;
+    hash->bytes = bytes;
+}
+
 /** Perform one SHA-256 transformation, processing 16 big endian 32-bit words. */
 static void secp256k1_sha256_transform(uint32_t* s, const unsigned char* buf) {
     uint32_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
