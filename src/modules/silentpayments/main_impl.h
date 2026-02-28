@@ -634,7 +634,12 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     /* Don't look further than the per-group recipient limit, in order to avoid quadratic scaling issues. */
     k_max = (n_tx_outputs < SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT) ?
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
-    /* TODO: potential optimization: the worst-case run-time can be cut in half by randomizing the outputs */
+    {
+    /* Track indices of already-found outputs in sorted order so that subsequent k iterations
+     * can skip them efficiently using a merge-scan pointer (O(N+K) per k, not O(N*K)). */
+    uint32_t found_indices[SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT];
+    uint32_t n_found_indices = 0;
+
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar t_k_scalar;
         secp256k1_xonly_pubkey unlabeled_output_xonly;
@@ -647,10 +652,12 @@ int secp256k1_silentpayments_recipient_scan_outputs(
          * the function `secp256k1_ge_set_all_gej_var`). This speeds up scanning significantly (>2x). */
         enum { LABEL_BATCH_SIZE = 8 }; /* batch size expressed in number of tx outputs */
         secp256k1_gej label_candidates_gej[2 * LABEL_BATCH_SIZE]; /* two candidates per tx output (one per y-parity) */
+        uint32_t label_batch_output_idx[LABEL_BATCH_SIZE]; /* maps batch entry to tx output index */
         size_t label_batch_idx = 0; /* current index within a batch */
         const unsigned char *label_tweak = NULL;
         secp256k1_ge label_ge;
         size_t j;
+        uint32_t fi = 0; /* merge-scan pointer into found_indices */
 
         /* Calculate the output tweak t_k and convert it to a scalar.
          *
@@ -679,6 +686,14 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         found_idx = -1;
         secp256k1_xonly_pubkey_save(&unlabeled_output_xonly, &unlabeled_output_ge);
         for (j = 0; j < n_tx_outputs; j++) {
+            /* Skip outputs that were already found in previous k iterations.
+             * The found_indices array is maintained in sorted order, so we advance
+             * a merge-scan pointer `fi` alongside `j` for O(N+K) total skipping. */
+            if (fi < n_found_indices && found_indices[fi] == (uint32_t)j) {
+                fi++;
+                continue;
+            }
+
             if (secp256k1_xonly_pubkey_cmp(ctx, &unlabeled_output_xonly, tx_outputs[j]) == 0) {
                 label_tweak = NULL;
                 found_idx = j;
@@ -700,13 +715,13 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_gej_add_ge_var(label_candidate1, &tx_output_gej, &unlabeled_output_negated_ge, NULL);
                 secp256k1_gej_neg(&tx_output_gej, &tx_output_gej);
                 secp256k1_gej_add_ge_var(label_candidate2, &tx_output_gej, &unlabeled_output_negated_ge, NULL);
+                label_batch_output_idx[label_batch_idx] = j;
                 label_batch_idx++;
                 /* If the batch is filled or we have reached the last transaction, perform batch
                  * inversion and check the label cache for each label candidate entry in the batch */
                 if (label_batch_idx == LABEL_BATCH_SIZE || j == (n_tx_outputs-1)) {
                     secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
                     unsigned char label33[33];
-                    size_t j_start = j + 1 - label_batch_idx; /* tx outputs index that matches the first batch entry */
 
                     secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
                     for (i = 0; i < label_batch_idx; i++) {
@@ -718,7 +733,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                         secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i], label33);
                         label_tweak = label_lookup(label33, label_context);
                         if (label_tweak != NULL) {
-                            found_idx = j_start + i;
+                            found_idx = label_batch_output_idx[i];
                             label_ge = label_candidates_ge[2 * i];
                             break;
                         }
@@ -726,7 +741,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                         secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i + 1], label33);
                         label_tweak = label_lookup(label33, label_context);
                         if (label_tweak != NULL) {
-                            found_idx = j_start + i;
+                            found_idx = label_batch_output_idx[i];
                             label_ge = label_candidates_ge[2 * i + 1];
                             break;
                         }
@@ -738,7 +753,43 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 }
             }
         }
+        /* Flush any remaining label candidates that weren't processed in the loop
+         * (can happen when the last output indices were skipped as already-found). */
+        if (found_idx == -1 && label_lookup != NULL && label_batch_idx > 0) {
+            secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
+            unsigned char label33[33];
+
+            secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
+            for (i = 0; i < label_batch_idx; i++) {
+                secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i], label33);
+                label_tweak = label_lookup(label33, label_context);
+                if (label_tweak != NULL) {
+                    found_idx = label_batch_output_idx[i];
+                    label_ge = label_candidates_ge[2 * i];
+                    break;
+                }
+
+                secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i + 1], label33);
+                label_tweak = label_lookup(label33, label_context);
+                if (label_tweak != NULL) {
+                    found_idx = label_batch_output_idx[i];
+                    label_ge = label_candidates_ge[2 * i + 1];
+                    break;
+                }
+            }
+        }
         if (found_idx != -1) {
+            /* Insert found_idx into found_indices in sorted order (insertion sort). */
+            {
+                uint32_t pos = n_found_indices;
+                while (pos > 0 && found_indices[pos - 1] > (uint32_t)found_idx) {
+                    found_indices[pos] = found_indices[pos - 1];
+                    pos--;
+                }
+                found_indices[pos] = (uint32_t)found_idx;
+                n_found_indices++;
+            }
+
             found_outputs[k]->output = *tx_outputs[found_idx];
             secp256k1_scalar_get_b32(found_outputs[k]->tweak, &t_k_scalar);
             /* Clear the t_k_scalar since we no longer need it and leaking this value would
@@ -771,6 +822,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             break;
         }
     }
+    } /* end found_indices scope */
     *n_found_outputs = k;
 
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
