@@ -584,6 +584,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(secp256k1_ecmult_gen_context_is_built(&ctx->ecmult_gen_ctx));
     ARG_CHECK(found_outputs != NULL);
     ARG_CHECK(n_found_outputs != NULL);
     ARG_CHECK(tx_outputs != NULL);
@@ -694,37 +695,51 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             return 0;
         }
 
-        /* Calculate unlabeled_output = unlabeled_spend_pubkey + t_k * G.
-         * This can fail if t_k * G is the negation of unlabeled_spend_pubkey, but this happens only with negligible
-         * probability for honestly created unlabeled_spend_pubkey as t_k is the output of a hash function. */
-        if (!secp256k1_eckey_pubkey_tweak_add(&unlabeled_output_ge, &t_k_scalar)) {
-            /* Leaking these values would break indistinguishability of the transaction, so clear them. */
-            secp256k1_scalar_clear(&t_k_scalar);
-            secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
-            return 0;
+        /* Compute tweak*G once. All variants (unlabeled + cached labels) share the same tweak,
+         * so we compute the generator multiplication once and then use cheap point additions. */
+        {
+            secp256k1_gej tweak_gej;
+            secp256k1_gej variant_gej[MAX_VARIANTS];
+            secp256k1_ge variant_ge[MAX_VARIANTS];
+
+            secp256k1_ecmult_gen(&ctx->ecmult_gen_ctx, &tweak_gej, &t_k_scalar);
+
+            /* unlabeled_output = unlabeled_spend_pubkey + t_k * G */
+            secp256k1_gej_add_ge_var(&variant_gej[0], &tweak_gej, &unlabeled_spend_pubkey_ge, NULL);
+            if (secp256k1_gej_is_infinity(&variant_gej[0])) {
+                /* t_k * G is the negation of unlabeled_spend_pubkey. Matches existing error behavior. */
+                secp256k1_scalar_clear(&t_k_scalar);
+                secp256k1_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                return 0;
+            }
+            n_variants = 1;
+
+            /* Compute variant outputs for each cached label: variant = cached_spend_ge + t_k * G. */
+            for (i = 0; i < n_cached_labels; i++) {
+                secp256k1_gej_add_ge_var(&variant_gej[n_variants], &tweak_gej, &cached_labels[i].spend_ge, NULL);
+                n_variants++;
+            }
+
+            /* Batch convert all variants to affine coordinates. */
+            secp256k1_ge_set_all_gej_var(variant_ge, variant_gej, n_variants);
+
+            /* Extract the unlabeled output (variant 0). */
+            unlabeled_output_ge = variant_ge[0];
+
+            /* Serialize all variant x-coordinates for fast memcmp matching.
+             * Infinity variants (from cached labels) get zero-filled serializations
+             * that will never match a valid output. */
+            for (i = 0; i < n_variants; i++) {
+                if (secp256k1_ge_is_infinity(&variant_ge[i])) {
+                    memset(variant_ser[i], 0, 32);
+                } else {
+                    secp256k1_fe_normalize_var(&variant_ge[i].x);
+                    secp256k1_fe_get_b32(variant_ser[i], &variant_ge[i].x);
+                }
+            }
         }
         /* Calculate unlabeled_output_negated = -unlabeled_output */
         secp256k1_ge_neg(&unlabeled_output_negated_ge, &unlabeled_output_ge);
-
-        /* Pre-serialize the unlabeled output's x-coordinate (variant 0). */
-        secp256k1_fe_normalize_var(&unlabeled_output_ge.x);
-        secp256k1_fe_get_b32(variant_ser[0], &unlabeled_output_ge.x);
-        n_variants = 1;
-
-        /* Compute variant outputs for each cached label: variant = cached_spend_ge + t_k * G.
-         * We use eckey_pubkey_tweak_add which computes key + tweak*G via Strauss double-multiply. */
-        for (i = 0; i < n_cached_labels; i++) {
-            secp256k1_ge variant_ge = cached_labels[i].spend_ge;
-            if (!secp256k1_eckey_pubkey_tweak_add(&variant_ge, &t_k_scalar)) {
-                /* t_k * G + cached_spend = infinity; skip this variant for this k.
-                 * Store a zero-filled serialization that will never match a valid output. */
-                memset(variant_ser[n_variants], 0, 32);
-            } else {
-                secp256k1_fe_normalize_var(&variant_ge.x);
-                secp256k1_fe_get_b32(variant_ser[n_variants], &variant_ge.x);
-            }
-            n_variants++;
-        }
 
         found_idx = -1;
         matched_variant = -1;
