@@ -640,11 +640,26 @@ int secp256k1_silentpayments_recipient_scan_outputs(
     uint32_t found_indices[SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT];
     uint32_t n_found_indices = 0;
 
+    /* Label cache: when a label is discovered at some k, we cache it so that subsequent k values
+     * can match outputs via cheap memcmp against pre-computed "variant" outputs (spend_pubkey + label
+     * + t_k*G) instead of performing expensive EC operations for label discovery. 16 entries with
+     * round-robin eviction; overflow is benign (only costs a cache miss, falling back to discovery). */
+    enum { LABEL_CACHE_SIZE = 16 };
+    /* Max number of variants = 1 (unlabeled) + LABEL_CACHE_SIZE */
+    enum { MAX_VARIANTS = 1 + LABEL_CACHE_SIZE };
+    struct {
+        secp256k1_ge spend_ge;      /* labeled spend pubkey: unlabeled_spend + label */
+        secp256k1_ge label_ge;      /* the label group element */
+        unsigned char label33[33];  /* serialized label (for output) */
+        unsigned char label_tweak[32]; /* label tweak bytes (copied from callback) */
+    } cached_labels[LABEL_CACHE_SIZE];
+    uint32_t n_cached_labels = 0;
+    uint32_t cached_label_next = 0; /* round-robin insertion index */
+
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar t_k_scalar;
         secp256k1_ge unlabeled_output_ge = unlabeled_spend_pubkey_ge;
         secp256k1_ge unlabeled_output_negated_ge;
-        unsigned char unlabeled_ser[32]; /* pre-serialized x-coord of unlabeled output */
         /* Label scanning involves the transformation from Jacobian (gej) to affine (ge) coordinates
          * for serializing label candidates. As this is an expensive operation involving modular
          * inversion, we don't do this one by one for each tx output, but collect multiple label
@@ -655,10 +670,17 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
         uint32_t label_batch_output_idx[LABEL_BATCH_SIZE]; /* maps batch entry to tx output index */
         size_t label_batch_idx = 0; /* current index within a batch */
-        const unsigned char *label_tweak = NULL;
+        const unsigned char *label_tweak_ptr = NULL;
         secp256k1_ge label_ge;
         size_t j;
         uint32_t fi = 0; /* merge-scan pointer into found_indices */
+
+        /* Variant outputs: variant_ser[0] = unlabeled output x-coord, variant_ser[1..n_cached_labels]
+         * = cached-label variant x-coords. matched_variant tracks which variant matched (-1 = none,
+         * 0 = unlabeled, 1..n = cached label index). */
+        unsigned char variant_ser[MAX_VARIANTS][32];
+        uint32_t n_variants;
+        int matched_variant;
 
         /* Calculate the output tweak t_k and convert it to a scalar.
          *
@@ -684,15 +706,32 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         /* Calculate unlabeled_output_negated = -unlabeled_output */
         secp256k1_ge_neg(&unlabeled_output_negated_ge, &unlabeled_output_ge);
 
-        /* Pre-serialize the unlabeled output's x-coordinate once per k, so that each
-         * output comparison only needs to serialize the tx output (not both keys). */
+        /* Pre-serialize the unlabeled output's x-coordinate (variant 0). */
         secp256k1_fe_normalize_var(&unlabeled_output_ge.x);
-        secp256k1_fe_get_b32(unlabeled_ser, &unlabeled_output_ge.x);
+        secp256k1_fe_get_b32(variant_ser[0], &unlabeled_output_ge.x);
+        n_variants = 1;
+
+        /* Compute variant outputs for each cached label: variant = cached_spend_ge + t_k * G.
+         * We use eckey_pubkey_tweak_add which computes key + tweak*G via Strauss double-multiply. */
+        for (i = 0; i < n_cached_labels; i++) {
+            secp256k1_ge variant_ge = cached_labels[i].spend_ge;
+            if (!secp256k1_eckey_pubkey_tweak_add(&variant_ge, &t_k_scalar)) {
+                /* t_k * G + cached_spend = infinity; skip this variant for this k.
+                 * Store a zero-filled serialization that will never match a valid output. */
+                memset(variant_ser[n_variants], 0, 32);
+            } else {
+                secp256k1_fe_normalize_var(&variant_ge.x);
+                secp256k1_fe_get_b32(variant_ser[n_variants], &variant_ge.x);
+            }
+            n_variants++;
+        }
 
         found_idx = -1;
+        matched_variant = -1;
         for (j = 0; j < n_tx_outputs; j++) {
             secp256k1_ge out_ge;
             unsigned char out_ser[32];
+            uint32_t v;
 
             /* Skip outputs that were already found in previous k iterations.
              * The found_indices array is maintained in sorted order, so we advance
@@ -709,13 +748,21 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_fe_normalize_var(&out_ge.x);
             secp256k1_fe_get_b32(out_ser, &out_ge.x);
 
-            if (secp256k1_memcmp_var(unlabeled_ser, out_ser, 32) == 0) {
-                label_tweak = NULL;
-                found_idx = j;
+            /* Check output against all variants (unlabeled + cached labels). The V memcmps per
+             * output are trivially cheap (~V*32 bytes) compared to EC operations. */
+            for (v = 0; v < n_variants; v++) {
+                if (secp256k1_memcmp_var(variant_ser[v], out_ser, 32) == 0) {
+                    found_idx = j;
+                    matched_variant = (int)v;
+                    break;
+                }
+            }
+            if (found_idx != -1) {
                 break;
             }
 
-            /* If not found, proceed to check for labels (if a label lookup function is provided). */
+            /* If not found via any variant, proceed to label discovery
+             * (if a label lookup function is provided). */
             if (label_lookup != NULL) {
                 secp256k1_gej out_gej;
                 secp256k1_gej *label_candidate1 = &label_candidates_gej[2 * label_batch_idx];
@@ -745,16 +792,16 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                          point at infinity.
                         */
                         secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i], label33);
-                        label_tweak = label_lookup(label33, label_context);
-                        if (label_tweak != NULL) {
+                        label_tweak_ptr = label_lookup(label33, label_context);
+                        if (label_tweak_ptr != NULL) {
                             found_idx = label_batch_output_idx[i];
                             label_ge = label_candidates_ge[2 * i];
                             break;
                         }
 
                         secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i + 1], label33);
-                        label_tweak = label_lookup(label33, label_context);
-                        if (label_tweak != NULL) {
+                        label_tweak_ptr = label_lookup(label33, label_context);
+                        if (label_tweak_ptr != NULL) {
                             found_idx = label_batch_output_idx[i];
                             label_ge = label_candidates_ge[2 * i + 1];
                             break;
@@ -775,16 +822,16 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
             for (i = 0; i < label_batch_idx; i++) {
                 secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i], label33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
+                label_tweak_ptr = label_lookup(label33, label_context);
+                if (label_tweak_ptr != NULL) {
                     found_idx = label_batch_output_idx[i];
                     label_ge = label_candidates_ge[2 * i];
                     break;
                 }
 
                 secp256k1_eckey_pubkey_serialize33(&label_candidates_ge[2 * i + 1], label33);
-                label_tweak = label_lookup(label33, label_context);
-                if (label_tweak != NULL) {
+                label_tweak_ptr = label_lookup(label33, label_context);
+                if (label_tweak_ptr != NULL) {
                     found_idx = label_batch_output_idx[i];
                     label_ge = label_candidates_ge[2 * i + 1];
                     break;
@@ -808,7 +855,21 @@ int secp256k1_silentpayments_recipient_scan_outputs(
             /* Clear the t_k_scalar since we no longer need it and leaking this value would
              * break indistinguishability of the transaction. */
             secp256k1_scalar_clear(&t_k_scalar);
-            if (label_tweak != NULL) {
+            if (matched_variant > 0) {
+                /* Matched a cached label variant. Retrieve label info from cache. */
+                uint32_t cache_idx = (uint32_t)(matched_variant - 1);
+                found_outputs[k]->found_with_label = 1;
+                if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[k]->tweak, cached_labels[cache_idx].label_tweak)) {
+                    memset(found_outputs[k]->tweak, 0, 32);
+                }
+                secp256k1_silentpayments_label_save(&found_outputs[k]->label, &cached_labels[cache_idx].label_ge);
+            } else if (label_tweak_ptr != NULL) {
+                /* Newly discovered label via label discovery path. Cache it for future k values. */
+                secp256k1_gej labeled_spend_gej;
+                secp256k1_ge labeled_spend_ge;
+                unsigned char label33_ser[33];
+                uint32_t ci = cached_label_next;
+
                 found_outputs[k]->found_with_label = 1;
                 /* This is extremely unlikely to fail in that it can only really fail if label_tweak
                  * is the negation of the shared secret tweak. But since both tweak and label_tweak are
@@ -819,23 +880,39 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                  * as a failure for Silent Payments because the output is still spendable with just the
                  * spend secret key. We set `tweak = 0` for this case.
                  */
-                if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[k]->tweak, label_tweak)) {
+                if (!secp256k1_ec_seckey_tweak_add(ctx, found_outputs[k]->tweak, label_tweak_ptr)) {
                     memset(found_outputs[k]->tweak, 0, 32);
                 }
                 secp256k1_silentpayments_label_save(&found_outputs[k]->label, &label_ge);
+
+                /* Cache this label: compute labeled_spend = unlabeled_spend + label */
+                secp256k1_eckey_pubkey_serialize33(&label_ge, label33_ser);
+                secp256k1_gej_set_ge(&labeled_spend_gej, &unlabeled_spend_pubkey_ge);
+                secp256k1_gej_add_ge_var(&labeled_spend_gej, &labeled_spend_gej, &label_ge, NULL);
+                if (!secp256k1_gej_is_infinity(&labeled_spend_gej)) {
+                    secp256k1_ge_set_gej_var(&labeled_spend_ge, &labeled_spend_gej);
+                    cached_labels[ci].spend_ge = labeled_spend_ge;
+                    cached_labels[ci].label_ge = label_ge;
+                    memcpy(cached_labels[ci].label33, label33_ser, 33);
+                    memcpy(cached_labels[ci].label_tweak, label_tweak_ptr, 32);
+                    cached_label_next = (ci + 1) % LABEL_CACHE_SIZE;
+                    if (n_cached_labels < LABEL_CACHE_SIZE) {
+                        n_cached_labels++;
+                    }
+                }
             } else {
                 found_outputs[k]->found_with_label = 0;
                 /* Set the label to an invalid value. */
                 memset(&found_outputs[k]->label, 0, sizeof(found_outputs[k]->label));
             }
             /* Reset everything for the next round of scanning. */
-            label_tweak = NULL;
+            label_tweak_ptr = NULL;
         } else {
             secp256k1_scalar_clear(&t_k_scalar);
             break;
         }
     }
-    } /* end found_indices scope */
+    } /* end found_indices/label_cache scope */
     *n_found_outputs = k;
 
     /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
