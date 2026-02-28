@@ -637,7 +637,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
              n_tx_outputs : SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT;
     {
     /* Track indices of already-found outputs in sorted order so that subsequent k iterations
-     * can skip them efficiently using a merge-scan pointer (O(N+K) per k, not O(N*K)). */
+     * can skip them efficiently via binary search (O(N*log K) per k, not O(N*K)). */
     uint32_t found_indices[SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT];
     uint32_t n_found_indices = 0;
 
@@ -674,7 +674,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         const unsigned char *label_tweak_ptr = NULL;
         secp256k1_ge label_ge;
         size_t j;
-        uint32_t fi = 0; /* merge-scan pointer into found_indices */
 
         /* Variant outputs: variant_ser[0] = unlabeled output x-coord, variant_ser[1..n_cached_labels]
          * = cached-label variant x-coords. matched_variant tracks which variant matched (-1 = none,
@@ -743,23 +742,51 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
         found_idx = -1;
         matched_variant = -1;
+
+        /* Derive a pseudorandom start offset from the output tweak scalar to randomize
+         * the scan order. This prevents an adversarial sender from placing the labeled
+         * output at a predictable position (e.g. last) to maximize scanning cost. */
+        {
+            unsigned char tweak_bytes[32];
+            size_t n_remaining = n_tx_outputs - n_found_indices;
+            size_t start_offset;
+            secp256k1_scalar_get_b32(tweak_bytes, &t_k_scalar);
+            start_offset = (n_remaining > 0) ? (size_t)(secp256k1_read_be64(tweak_bytes) % n_remaining) : 0;
+
         for (j = 0; j < n_tx_outputs; j++) {
+            /* Map j through rotation: scan starting from start_offset, wrapping around.
+             * j_actual = (start_offset + j) % n_tx_outputs */
+            size_t j_actual = (start_offset + j) % n_tx_outputs;
             secp256k1_ge out_ge;
             unsigned char out_ser[32];
             uint32_t v;
 
             /* Skip outputs that were already found in previous k iterations.
-             * The found_indices array is maintained in sorted order, so we advance
-             * a merge-scan pointer `fi` alongside `j` for O(N+K) total skipping. */
-            if (fi < n_found_indices && found_indices[fi] == (uint32_t)j) {
-                fi++;
-                continue;
+             * Use binary search in the sorted found_indices array since the rotated
+             * scan order prevents using a merge-scan pointer. */
+            if (n_found_indices > 0) {
+                uint32_t lo = 0, hi = n_found_indices;
+                int is_found = 0;
+                while (lo < hi) {
+                    uint32_t mid = lo + (hi - lo) / 2;
+                    if (found_indices[mid] == (uint32_t)j_actual) {
+                        is_found = 1;
+                        break;
+                    } else if (found_indices[mid] < (uint32_t)j_actual) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if (is_found) {
+                    continue;
+                }
             }
 
             /* Load output group element once and serialize its x-coordinate for comparison.
              * This avoids the double-serialize cost of secp256k1_xonly_pubkey_cmp and lets
              * us reuse the loaded out_ge for label candidate computation below. */
-            secp256k1_xonly_pubkey_load(ctx, &out_ge, tx_outputs[j]);
+            secp256k1_xonly_pubkey_load(ctx, &out_ge, tx_outputs[j_actual]);
             secp256k1_fe_normalize_var(&out_ge.x);
             secp256k1_fe_get_b32(out_ser, &out_ge.x);
 
@@ -767,7 +794,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
              * output are trivially cheap (~V*32 bytes) compared to EC operations. */
             for (v = 0; v < n_variants; v++) {
                 if (secp256k1_memcmp_var(variant_ser[v], out_ser, 32) == 0) {
-                    found_idx = j;
+                    found_idx = j_actual;
                     matched_variant = (int)v;
                     break;
                 }
@@ -792,11 +819,11 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 secp256k1_gej_add_ge_var(label_candidate1, &out_gej, &unlabeled_output_negated_ge, NULL);
                 secp256k1_gej_neg(&out_gej, &out_gej);
                 secp256k1_gej_add_ge_var(label_candidate2, &out_gej, &unlabeled_output_negated_ge, NULL);
-                label_batch_output_idx[label_batch_idx] = j;
+                label_batch_output_idx[label_batch_idx] = j_actual;
                 label_batch_idx++;
-                /* If the batch is filled or we have reached the last transaction, perform batch
-                 * inversion and check the label cache for each label candidate entry in the batch */
-                if (label_batch_idx == LABEL_BATCH_SIZE || j == (n_tx_outputs-1)) {
+                /* If the batch is filled, perform batch inversion and check the label
+                 * cache for each label candidate entry in the batch */
+                if (label_batch_idx == LABEL_BATCH_SIZE) {
                     unsigned char label33[33];
 
                     secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
@@ -829,8 +856,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 }
             }
         }
-        /* Flush any remaining label candidates that weren't processed in the loop
-         * (can happen when the last output indices were skipped as already-found). */
+        /* Flush any remaining label candidates after the loop completes. */
         if (found_idx == -1 && label_lookup != NULL && label_batch_idx > 0) {
             unsigned char label33[33];
 
@@ -853,6 +879,7 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 }
             }
         }
+        } /* end rotation scope */
         if (found_idx != -1) {
             /* Insert found_idx into found_indices in sorted order (insertion sort). */
             {
