@@ -650,8 +650,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
          * inversion, we don't do this one by one for each tx output, but collect multiple label
          * candidates in Jacobian in order to apply Montgomery's trick for batch inversion (using
          * the function `secp256k1_ge_set_all_gej_var`). This speeds up scanning significantly (>2x). */
-        enum { LABEL_BATCH_SIZE = 8 }; /* batch size expressed in number of tx outputs */
+        enum { LABEL_BATCH_SIZE = 32 }; /* batch size expressed in number of tx outputs */
         secp256k1_gej label_candidates_gej[2 * LABEL_BATCH_SIZE]; /* two candidates per tx output (one per y-parity) */
+        secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
         uint32_t label_batch_output_idx[LABEL_BATCH_SIZE]; /* maps batch entry to tx output index */
         size_t label_batch_idx = 0; /* current index within a batch */
         const unsigned char *label_tweak = NULL;
@@ -720,7 +721,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 /* If the batch is filled or we have reached the last transaction, perform batch
                  * inversion and check the label cache for each label candidate entry in the batch */
                 if (label_batch_idx == LABEL_BATCH_SIZE || j == (n_tx_outputs-1)) {
-                    secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
                     unsigned char label33[33];
 
                     secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
@@ -756,7 +756,6 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         /* Flush any remaining label candidates that weren't processed in the loop
          * (can happen when the last output indices were skipped as already-found). */
         if (found_idx == -1 && label_lookup != NULL && label_batch_idx > 0) {
-            secp256k1_ge label_candidates_ge[2 * LABEL_BATCH_SIZE];
             unsigned char label33[33];
 
             secp256k1_ge_set_all_gej_var(label_candidates_ge, label_candidates_gej, 2 * label_batch_idx);
