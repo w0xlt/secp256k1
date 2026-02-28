@@ -642,9 +642,9 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
     for (k = 0; k < k_max; k++) {
         secp256k1_scalar t_k_scalar;
-        secp256k1_xonly_pubkey unlabeled_output_xonly;
         secp256k1_ge unlabeled_output_ge = unlabeled_spend_pubkey_ge;
         secp256k1_ge unlabeled_output_negated_ge;
+        unsigned char unlabeled_ser[32]; /* pre-serialized x-coord of unlabeled output */
         /* Label scanning involves the transformation from Jacobian (gej) to affine (ge) coordinates
          * for serializing label candidates. As this is an expensive operation involving modular
          * inversion, we don't do this one by one for each tx output, but collect multiple label
@@ -684,9 +684,16 @@ int secp256k1_silentpayments_recipient_scan_outputs(
         /* Calculate unlabeled_output_negated = -unlabeled_output */
         secp256k1_ge_neg(&unlabeled_output_negated_ge, &unlabeled_output_ge);
 
+        /* Pre-serialize the unlabeled output's x-coordinate once per k, so that each
+         * output comparison only needs to serialize the tx output (not both keys). */
+        secp256k1_fe_normalize_var(&unlabeled_output_ge.x);
+        secp256k1_fe_get_b32(unlabeled_ser, &unlabeled_output_ge.x);
+
         found_idx = -1;
-        secp256k1_xonly_pubkey_save(&unlabeled_output_xonly, &unlabeled_output_ge);
         for (j = 0; j < n_tx_outputs; j++) {
+            secp256k1_ge out_ge;
+            unsigned char out_ser[32];
+
             /* Skip outputs that were already found in previous k iterations.
              * The found_indices array is maintained in sorted order, so we advance
              * a merge-scan pointer `fi` alongside `j` for O(N+K) total skipping. */
@@ -695,7 +702,14 @@ int secp256k1_silentpayments_recipient_scan_outputs(
                 continue;
             }
 
-            if (secp256k1_xonly_pubkey_cmp(ctx, &unlabeled_output_xonly, tx_outputs[j]) == 0) {
+            /* Load output group element once and serialize its x-coordinate for comparison.
+             * This avoids the double-serialize cost of secp256k1_xonly_pubkey_cmp and lets
+             * us reuse the loaded out_ge for label candidate computation below. */
+            secp256k1_xonly_pubkey_load(ctx, &out_ge, tx_outputs[j]);
+            secp256k1_fe_normalize_var(&out_ge.x);
+            secp256k1_fe_get_b32(out_ser, &out_ge.x);
+
+            if (secp256k1_memcmp_var(unlabeled_ser, out_ser, 32) == 0) {
                 label_tweak = NULL;
                 found_idx = j;
                 break;
@@ -703,19 +717,19 @@ int secp256k1_silentpayments_recipient_scan_outputs(
 
             /* If not found, proceed to check for labels (if a label lookup function is provided). */
             if (label_lookup != NULL) {
-                secp256k1_gej tx_output_gej;
+                secp256k1_gej out_gej;
                 secp256k1_gej *label_candidate1 = &label_candidates_gej[2 * label_batch_idx];
                 secp256k1_gej *label_candidate2 = &label_candidates_gej[2 * label_batch_idx + 1];
 
                 /* Calculate scan label candidates:
                  *     label_candidate1 =  tx_output - unlabeled_output
                  *     label_candidate2 = -tx_output - unlabeled_output
-                 * and store them in the batch */
-                secp256k1_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
-                secp256k1_gej_set_ge(&tx_output_gej, &tx_output_ge);
-                secp256k1_gej_add_ge_var(label_candidate1, &tx_output_gej, &unlabeled_output_negated_ge, NULL);
-                secp256k1_gej_neg(&tx_output_gej, &tx_output_gej);
-                secp256k1_gej_add_ge_var(label_candidate2, &tx_output_gej, &unlabeled_output_negated_ge, NULL);
+                 * and store them in the batch.
+                 * Reuse the already-loaded out_ge (no redundant secp256k1_xonly_pubkey_load). */
+                secp256k1_gej_set_ge(&out_gej, &out_ge);
+                secp256k1_gej_add_ge_var(label_candidate1, &out_gej, &unlabeled_output_negated_ge, NULL);
+                secp256k1_gej_neg(&out_gej, &out_gej);
+                secp256k1_gej_add_ge_var(label_candidate2, &out_gej, &unlabeled_output_negated_ge, NULL);
                 label_batch_output_idx[label_batch_idx] = j;
                 label_batch_idx++;
                 /* If the batch is filled or we have reached the last transaction, perform batch
