@@ -175,6 +175,33 @@ SECP256K1_API int secp256k1_musig_partial_sig_serialize(
     const secp256k1_musig_partial_sig *sig
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3);
 
+/** Extract the key aggregation coefficient and seckey negation flag for a pubkey. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_musig_get_keyaggcoef_and_negation_seckey(
+    const secp256k1_context *ctx,
+    unsigned char *keyaggcoef,
+    int *negate_seckey,
+    const secp256k1_musig_keyagg_cache *keyagg_cache,
+    const secp256k1_pubkey *pubkey
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
+
+/** Determine whether a secret key must be negated for a tweaked aggregate key. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_musig_negate_seckey(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *aggregate_pubkey,
+    int parity_acc,
+    int *negate_seckey
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(4);
+
+/** Apply x-only tweaking to a plain aggregate pubkey while tracking parity/tweak state. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_pubkey_xonly_tweak_add(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *output_pubkey,
+    int *parity_acc,
+    const secp256k1_pubkey *aggregate_pubkey,
+    const unsigned char *tweak32,
+    unsigned char *out_tweak32
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
 /** Computes an aggregate public key and uses it to initialize a keyagg_cache
  *
  *  Different orders of `pubkeys` result in different `agg_pk`s.
@@ -479,6 +506,29 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_musig_nonce_process(
     const secp256k1_musig_keyagg_cache *keyagg_cache
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
 
+/** Create a blinded session using a MuSig keyagg cache. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_nonce_process(
+    const secp256k1_context *ctx,
+    secp256k1_musig_session *session,
+    const secp256k1_musig_aggnonce *aggnonce,
+    const unsigned char *msg32,
+    const secp256k1_musig_keyagg_cache *keyagg_cache,
+    const secp256k1_pubkey *adaptor,
+    unsigned char *blinding_factor
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(7);
+
+/** Create a blinded session for Mercury's plain aggregate-key flow. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_nonce_process_without_keyaggcoeff(
+    const secp256k1_context *ctx,
+    secp256k1_musig_session *session,
+    const secp256k1_musig_aggnonce *aggnonce,
+    const unsigned char *msg32,
+    const secp256k1_pubkey *aggregate_pubkey,
+    const secp256k1_pubkey *adaptor,
+    unsigned char *blinding_factor,
+    const unsigned char *tweak32
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(7) SECP256K1_ARG_NONNULL(8);
+
 /** Produces a partial signature
  *
  *  This function overwrites the given secnonce with zeros and will abort if given a
@@ -520,6 +570,40 @@ SECP256K1_API int secp256k1_musig_partial_sign(
     const secp256k1_musig_session *session
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
 
+/** Extract the session challenge for Mercury's split signing flow. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_get_challenge_from_session(
+    const secp256k1_context *ctx,
+    const secp256k1_musig_session *session,
+    unsigned char *challenge
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3);
+
+/** Zero the final nonce bytes in a session before transport/storage. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_remove_fin_nonce_from_session(
+    const secp256k1_context *ctx,
+    secp256k1_musig_session *session
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2);
+
+/** Produce a Mercury blinded partial signature using an explicit keyagg coefficient. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_partial_sign(
+    const secp256k1_context *ctx,
+    secp256k1_musig_partial_sig *partial_sig,
+    secp256k1_musig_secnonce *secnonce,
+    const secp256k1_keypair *keypair,
+    const secp256k1_musig_session *session,
+    const unsigned char *keyaggcoef,
+    int negate_seckey
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
+/** Produce a Mercury blinded partial signature with keyagg coefficient fixed to 1. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_partial_sign_without_keyaggcoeff(
+    const secp256k1_context *ctx,
+    secp256k1_musig_partial_sig *partial_sig,
+    secp256k1_musig_secnonce *secnonce,
+    const secp256k1_keypair *keypair,
+    const secp256k1_musig_session *session,
+    int negate_seckey
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
+
 /** Verifies an individual signer's partial signature
  *
  *  The signature is verified for a specific signing session. In order to avoid
@@ -559,6 +643,17 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_musig_partial_sig_verif
     const secp256k1_pubkey *pubkey,
     const secp256k1_musig_keyagg_cache *keyagg_cache,
     const secp256k1_musig_session *session
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
+/** Verify a Mercury blinded partial signature against a plain aggregate key. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_blinded_musig_partial_sig_verify(
+    const secp256k1_context *ctx,
+    const secp256k1_musig_partial_sig *partial_sig,
+    const secp256k1_musig_pubnonce *pubnonce,
+    const secp256k1_pubkey *pubkey,
+    const secp256k1_pubkey *aggregate_pubkey,
+    const secp256k1_musig_session *session,
+    int parity_acc
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
 
 /** Aggregates partial signatures
