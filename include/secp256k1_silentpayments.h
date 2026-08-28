@@ -324,6 +324,31 @@ typedef struct secp256k1_silentpayments_found_output {
     secp256k1_silentpayments_label label;
 } secp256k1_silentpayments_found_output;
 
+/** All-match scan result struct.
+ *
+ *  Struct for holding one transaction output found by
+ *  secp256k1_silentpayments_recipient_scan_outputs_all, along with its
+ *  derivation metadata.
+ *
+ *            output: the x-only public key for the taproot output
+ *             tweak: the 32-byte tweak needed to spend the output
+ *  found_with_label: boolean value to indicate if the output was sent to a
+ *                    labeled address. If true, label will be set to a valid value.
+ *             label: the label used. If found_with_label = false, this is set to
+ *                    an invalid value.
+ *                 k: the output counter used to derive this output
+ *      output_index: the position of this output in the tx_outputs array passed
+ *                    to secp256k1_silentpayments_recipient_scan_outputs_all
+ */
+typedef struct secp256k1_silentpayments_scan_result {
+    secp256k1_xonly_pubkey output;
+    unsigned char tweak[32];
+    int found_with_label;
+    secp256k1_silentpayments_label label;
+    uint32_t k;
+    size_t output_index;
+} secp256k1_silentpayments_scan_result;
+
 /** Scan for Silent Payments transaction outputs.
  *
  *  Given a prevouts_summary object, a recipient's 32 byte scan key and spend public key,
@@ -340,6 +365,10 @@ typedef struct secp256k1_silentpayments_found_output {
  *
  *  For creating the label cache, `secp256k1_silentpayments_recipient_label_create`
  *  and `secp256k1_silentpayments_recipient_label_serialize` can be used.
+ *
+ *  For each output counter k, scanning returns the first matching tx output.
+ *  Scanning stops at the first k without a match. Outputs belonging to a later
+ *  counter are not examined after an empty counter.
  *
  *  Note:
  *  Scanning is bounded by SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT and may
@@ -380,6 +409,65 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_silentpayments_recipien
     const secp256k1_context *ctx,
     secp256k1_silentpayments_found_output **found_outputs,
     uint32_t *n_found_outputs,
+    const secp256k1_xonly_pubkey * const *tx_outputs,
+    size_t n_tx_outputs,
+    const unsigned char *scan_key32,
+    const secp256k1_silentpayments_prevouts_summary *prevouts_summary,
+    const secp256k1_pubkey *unlabeled_spend_pubkey,
+    secp256k1_silentpayments_label_lookup label_lookup,
+    const void *label_context
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(6) SECP256K1_ARG_NONNULL(7) SECP256K1_ARG_NONNULL(8);
+
+/** Scan for every Silent Payments transaction output in each matched counter round.
+ *
+ *  This function accepts the same recipient and transaction data as
+ *  secp256k1_silentpayments_recipient_scan_outputs. Unlike that function, it
+ *  traverses every tx output for each counter k and returns every matching
+ *  tx_outputs position. Scanning stops at the first k without a match; outputs
+ *  belonging to a later counter are not examined after an empty counter.
+ *
+ *  Results are compacted in tx_outputs order. Each valid result contains its
+ *  original tx_outputs position and counter k. Equal keys at different
+ *  positions produce separate results, but each position is returned at most
+ *  once. If one position has more than one valid derivation, including a
+ *  derivation at a second counter, scanning fails instead of choosing one.
+ *
+ *  Result objects are left unchanged if validation fails before result
+ *  initialization. Once initialized, all n_tx_outputs result objects are
+ *  cleared. After a successful call, the first n_scan_results objects are valid
+ *  and all remaining objects are all-zero. They are also all-zero if scanning
+ *  fails after initialization.
+ *
+ *  The label_lookup callback has the same contract as for
+ *  secp256k1_silentpayments_recipient_scan_outputs.
+ *
+ *  Full traversal is bounded by SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT
+ *  counter rounds. Its worst-case work is proportional to n_tx_outputs times
+ *  that bound. Callers that only need first-match discovery should use
+ *  secp256k1_silentpayments_recipient_scan_outputs.
+ *
+ *  Returns: 1 if output scanning was successful, including when no output was found.
+ *           0 if an argument or key is invalid, an internal derivation fails,
+ *             or one tx output has multiple valid derivations.
+ *
+ *  Args:                   ctx: pointer to a context object
+ *  Out:           scan_results: pointer to an array of pointers to result
+ *                               objects. The array MUST have n_tx_outputs entries,
+ *                               each pointing to a distinct object
+ *              n_scan_results: pointer to the number of valid compacted results
+ *  In:              tx_outputs: pointer to the transaction's x-only public key
+ *                               outputs, in their original transaction order
+ *                 n_tx_outputs: the size of tx_outputs and scan_results
+ *                   scan_key32: pointer to the recipient's 32-byte scan key
+ *             prevouts_summary: pointer to the transaction prevouts summary data
+ *       unlabeled_spend_pubkey: pointer to the recipient's unlabeled spend public key
+ *                 label_lookup: label-cache lookup callback, or NULL
+ *                label_context: callback context, or NULL
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_silentpayments_recipient_scan_outputs_all(
+    const secp256k1_context *ctx,
+    secp256k1_silentpayments_scan_result **scan_results,
+    size_t *n_scan_results,
     const secp256k1_xonly_pubkey * const *tx_outputs,
     size_t n_tx_outputs,
     const unsigned char *scan_key32,

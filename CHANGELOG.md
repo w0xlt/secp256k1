@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+#### Added
+ - New function `secp256k1_silentpayments_recipient_scan_outputs_all` returns
+   every matching Silent Payments transaction-output position in each
+   consecutive matched counter round, together with its output index and
+   counter.
+
+#### ABI Compatibility
+The ABI is backward compatible with version 0.8.0. The existing Silent Payments
+result type and first-match scanning function are unchanged; the all-match result
+type and function are additive.
+
 ## [0.8.0] - 2026-08-03
 
 #### Added
