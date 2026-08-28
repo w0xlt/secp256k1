@@ -14,7 +14,7 @@
 /* maximum non-coinbase taproot outputs per block: largest N for 1-in-N-out P2TR transaction
  * that has a vsize <= (1_000_000 - 81 - 64) [https://bitcoin.stackexchange.com/a/122952]
  * (needed for constructing the "worst-case scanning attack", where a single
- *  tx fills up a full bock of taproot outputs that all go to the same scankey group) */
+ *  tx fills up a full block of taproot outputs that all go to the same scankey group) */
 #define MAX_P2TR_OUTPUTS_PER_BLOCK 23250
 
 #define SP_BENCH_MAX_INPUTS  1
@@ -28,8 +28,8 @@ typedef struct {
     secp256k1_xonly_pubkey **tx_outputs_ptrs;
     secp256k1_xonly_pubkey tx_inputs[SP_BENCH_MAX_INPUTS];
     const secp256k1_xonly_pubkey *tx_inputs_ptrs[SP_BENCH_MAX_INPUTS];
-    secp256k1_silentpayments_found_output *found_outputs;
-    secp256k1_silentpayments_found_output **found_outputs_ptrs;
+    secp256k1_silentpayments_scan_result *scan_results;
+    secp256k1_silentpayments_scan_result **scan_results_ptrs;
     unsigned char smallest_outpoint[36];
     unsigned char label[33];
     unsigned char label_tweak[32];
@@ -107,8 +107,8 @@ static void bench_silentpayments_scan_setup(void* arg) {
 
         data->tx_outputs = malloc(sizeof(secp256k1_xonly_pubkey) * data->num_outputs);
         data->tx_outputs_ptrs = malloc(sizeof(secp256k1_xonly_pubkey*) * data->num_outputs);
-        data->found_outputs = malloc(sizeof(secp256k1_silentpayments_found_output) * data->num_outputs);
-        data->found_outputs_ptrs = malloc(sizeof(secp256k1_silentpayments_found_output*) * data->num_outputs);
+        data->scan_results = malloc(sizeof(secp256k1_silentpayments_scan_result) * data->num_outputs);
+        data->scan_results_ptrs = malloc(sizeof(secp256k1_silentpayments_scan_result*) * data->num_outputs);
 
         keypairs_ptrs[0] = &input_keypair;
         for (i = 0; i < data->num_outputs; i++) {
@@ -131,7 +131,7 @@ static void bench_silentpayments_scan_setup(void* arg) {
             data->num_outputs, data->smallest_outpoint, keypairs_ptrs, SP_BENCH_MAX_INPUTS, NULL, 0));
 
         for (i = 0; i < data->num_outputs; i++) {
-            data->found_outputs_ptrs[i] = &data->found_outputs[i];
+            data->scan_results_ptrs[i] = &data->scan_results[i];
         }
         /* reverse outputs within k group to simulate worst-case */
         for (i = 0; i < data->num_matches / 2; i++) {
@@ -152,14 +152,14 @@ static void bench_silentpayments_scan_teardown(void* arg, int iters) {
 
     free(data->tx_outputs);
     free(data->tx_outputs_ptrs);
-    free(data->found_outputs);
-    free(data->found_outputs_ptrs);
+    free(data->scan_results);
+    free(data->scan_results_ptrs);
 }
 
 static void bench_silentpayments_scan(void* arg, int iters) {
     bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
     secp256k1_silentpayments_prevouts_summary prevouts_summary;
-    uint32_t n_found = 0;
+    size_t n_found = 0;
     int i;
     const secp256k1_silentpayments_label_lookup label_lookup_fn = label_lookup;
     const void *label_context = data;
@@ -169,18 +169,19 @@ static void bench_silentpayments_scan(void* arg, int iters) {
     for (i = 0; i < iters; i++) {
         CHECK(secp256k1_silentpayments_recipient_prevouts_summary_create(data->ctx, &prevouts_summary,
             data->smallest_outpoint, data->tx_inputs_ptrs, SP_BENCH_MAX_INPUTS, NULL, 0));
-        CHECK(secp256k1_silentpayments_recipient_scan_outputs(data->ctx,
-            data->found_outputs_ptrs, &n_found,
+        CHECK(secp256k1_silentpayments_recipient_scan_outputs_all(data->ctx,
+            data->scan_results_ptrs, &n_found,
             (const secp256k1_xonly_pubkey**)data->tx_outputs_ptrs, data->num_outputs,
             data->scan_key, &prevouts_summary, &data->spend_pubkey,
             label_lookup_fn, label_context)
         );
-        CHECK(n_found == (uint32_t)data->num_matches);
+        CHECK(n_found == (size_t)data->num_matches);
     }
 }
 
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
     bench_silentpayments_data data;
+    const int reduced_iters = 1 + (iters - 1) / 100;
     int d = argc == 1;
 
     data.ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
@@ -199,6 +200,35 @@ static void run_silentpayments_bench(int iters, int argc, char** argv) {
                 printf("Skipping benchmark \"%s\" due to SECP256K1_BENCH_ITERS <= 2\n", str);
             } else {
                 run_benchmark(str, bench_silentpayments_scan, bench_silentpayments_scan_setup, bench_silentpayments_scan_teardown, &data, 10, num_outputs <= 10 ? iters : 1);
+            }
+        }
+    }
+
+    if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_scan_match")) {
+        char str[64];
+        data.num_outputs = 2;
+        data.num_matches = 1;
+        sprintf(str, "silentpayments_scan_match_N=%i_K=%i", data.num_outputs, data.num_matches);
+        run_benchmark(str, bench_silentpayments_scan, bench_silentpayments_scan_setup,
+                      bench_silentpayments_scan_teardown, &data, 5, reduced_iters);
+    }
+
+    if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_scan_targeted")) {
+        const int num_outputs_bench[] = {10, 100, 1000, SECP256K1_SILENTPAYMENTS_RECIPIENT_GROUP_LIMIT};
+        size_t o;
+        for (o = 0; o < ARRAY_SIZE(num_outputs_bench); o++) {
+            const int num_outputs = num_outputs_bench[o];
+            char str[64];
+            data.num_outputs = num_outputs;
+            data.num_matches = num_outputs;
+            sprintf(str, "silentpayments_scan_targeted_N=K=%i", num_outputs);
+            /* Avoid slow targeted cases in reduced-iteration CI runs. */
+            if (iters <= 2 && num_outputs > 10) {
+                printf("Skipping benchmark \"%s\" due to SECP256K1_BENCH_ITERS <= 2\n", str);
+            } else {
+                run_benchmark(str, bench_silentpayments_scan, bench_silentpayments_scan_setup,
+                              bench_silentpayments_scan_teardown, &data, num_outputs <= 10 ? 5 : 3,
+                              num_outputs <= 10 ? reduced_iters : 1);
             }
         }
     }
